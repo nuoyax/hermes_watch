@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod detail;
+pub mod globe3d;
 pub mod ground_track;
 pub mod world_map;
 

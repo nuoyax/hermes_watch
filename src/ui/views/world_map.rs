@@ -1,21 +1,36 @@
-//! World map view: equirectangular projection with live satellite positions.
+//! World map (2D equirectangular) view with real Natural Earth coastlines,
+//! graticule labels, satellite positions and hover tooltips.
 
+use crate::data::model::{Sat, SatGroup};
 use crate::orbit::GeoPoint;
-use crate::data::model::Sat;
-use egui::{Color32, Painter, Pos2, Rect};
+use egui::{Color32, Painter, Pos2, Rect, Stroke};
 
-/// Render the world map view into `rect`.
+use crate::ui::earth;
+
+/// Render the world map view into `rect`. Returns hovered satellite index (if any).
 pub fn show_world_map(
     painter: &Painter,
     rect: Rect,
     sats: &[Sat],
     positions: &[Option<GeoPoint>],
-    groups_enabled: &std::collections::HashSet<crate::data::model::SatGroup>,
-) {
-    draw_grid(painter, rect);
-    draw_continents(painter, rect);
+    groups_enabled: &std::collections::HashSet<SatGroup>,
+    selected: Option<u32>,
+) -> Option<usize> {
+    // Ocean background.
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(18, 28, 48));
 
-    for (sat, pos) in sats.iter().zip(positions.iter()) {
+    draw_grid(painter, rect);
+    draw_coastlines(painter, rect);
+
+    // Satellites + hover detection.
+    let pointer = painter
+        .ctx()
+        .input(|i| i.pointer.latest_pos())
+        .filter(|p| rect.contains(*p));
+    let mut hovered = None;
+    let mut best = 12.0_f32;
+
+    for (idx, (sat, pos)) in sats.iter().zip(positions.iter()).enumerate() {
         if !groups_enabled.contains(&sat.group) {
             continue;
         }
@@ -23,11 +38,40 @@ pub fn show_world_map(
         let Some(spot) = project(rect, p.lat_deg, p.lon_deg) else {
             continue;
         };
-        painter.circle_filled(spot, 3.0, sat.group.color());
+        let is_sel = selected == Some(sat.norad_id);
+        let radius = if is_sel { 5.0 } else { 3.0 };
+        painter.circle_filled(spot, radius, sat.group.color());
+        if is_sel {
+            painter.circle_stroke(spot, 8.0, Stroke::new(1.5, Color32::WHITE));
+        }
+        if let Some(mouse) = pointer {
+            let d = mouse.distance(spot);
+            if d < best {
+                best = d;
+                hovered = Some(idx);
+            }
+        }
     }
+
+    // Tooltip for hovered satellite.
+    if let Some(idx) = hovered {
+        if let (Some(sat), Some(Some(p))) = (sats.get(idx), positions.get(idx)) {
+            if let Some(spot) = project(rect, p.lat_deg, p.lon_deg) {
+                painter.text(
+                    spot + egui::Vec2::new(10.0, -10.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{}\n#{} · {} km", sat.name, sat.norad_id, p.alt_km as i32),
+                    egui::FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+    }
+
+    hovered
 }
 
-/// Map lat/lon (deg) to pixel coords; None if outside the visible wrap.
+/// Map lat/lon (deg) to pixel coords.
 pub fn project(rect: Rect, lat: f64, lon: f64) -> Option<Pos2> {
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return None;
@@ -49,10 +93,23 @@ pub fn project_public(rect: Rect, lat: f64, lon: f64) -> Option<Pos2> {
 
 fn draw_grid(painter: &Painter, rect: Rect) {
     let c = Color32::from_rgb(45, 50, 60);
+    let label_c = Color32::from_rgb(110, 115, 125);
     for lon in [-180, -120, -60, 0, 60, 120, 180] {
         if let Some(a) = project(rect, 90.0, lon as f64) {
             if let Some(b) = project(rect, -90.0, lon as f64) {
-                painter.line_segment([a, b], egui::Stroke::new(1.0, c));
+                painter.line_segment([a, b], Stroke::new(1.0, c));
+            }
+        }
+        if lon != -180 && lon != 180 {
+            let label = if lon == 0 { "0°".to_string() } else { format!("{lon}°") };
+            if let Some(p) = project(rect, -84.0, lon as f64) {
+                painter.text(
+                    p,
+                    egui::Align2::CENTER_TOP,
+                    label,
+                    egui::FontId::proportional(9.0),
+                    label_c,
+                );
             }
         }
     }
@@ -60,44 +117,40 @@ fn draw_grid(painter: &Painter, rect: Rect) {
         if let Some(a) = project(rect, lat as f64, -180.0) {
             if let Some(b) = project(rect, lat as f64, 180.0) {
                 let stroke = if lat == 0 {
-                    egui::Stroke::new(1.5, Color32::from_rgb(60, 70, 90))
+                    Stroke::new(1.5, Color32::from_rgb(60, 70, 90))
                 } else {
-                    egui::Stroke::new(1.0, c)
+                    Stroke::new(1.0, c)
                 };
                 painter.line_segment([a, b], stroke);
             }
         }
+        let label = if lat == 0 { "Eq".to_string() } else { format!("{lat}°") };
+        if let Some(p) = project(rect, lat as f64, -176.0) {
+            painter.text(
+                p,
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(9.0),
+                label_c,
+            );
+        }
     }
 }
 
-/// Very coarse continent outlines (lat, lon polylines) for orientation.
-const CONTINENTS: &[&[(f64, f64)]] = &[
-    // North America (rough)
-    &[(70.0, -160.0), (60.0, -140.0), (48.0, -125.0), (30.0, -115.0), (23.0, -110.0), (18.0, -95.0), (25.0, -80.0), (40.0, -70.0), (47.0, -55.0), (60.0, -65.0), (70.0, -80.0), (70.0, -160.0)],
-    // South America
-    &[(12.0, -72.0), (0.0, -80.0), (-15.0, -75.0), (-35.0, -72.0), (-55.0, -68.0), (-50.0, -65.0), (-20.0, -40.0), (-5.0, -35.0), (5.0, -50.0), (12.0, -72.0)],
-    // Europe + Asia (rough)
-    &[(36.0, -10.0), (43.0, 5.0), (55.0, 10.0), (60.0, 25.0), (70.0, 30.0), (75.0, 60.0), (70.0, 100.0), (65.0, 140.0), (60.0, 160.0), (55.0, 160.0), (45.0, 135.0), (30.0, 122.0), (20.0, 110.0), (10.0, 105.0), (8.0, 98.0), (22.0, 88.0), (15.0, 73.0), (22.0, 60.0), (25.0, 55.0), (38.0, 48.0), (36.0, 20.0), (36.0, -10.0)],
-    // Africa
-    &[(35.0, -5.0), (32.0, 22.0), (30.0, 33.0), (12.0, 43.0), (0.0, 42.0), (-10.0, 40.0), (-25.0, 33.0), (-34.0, 20.0), (-25.0, 15.0), (-10.0, 13.0), (4.0, 9.0), (5.0, -5.0), (10.0, -15.0), (20.0, -17.0), (28.0, -13.0), (35.0, -5.0)],
-    // Australia
-    &[(-12.0, 131.0), (-18.0, 122.0), (-33.0, 115.0), (-38.0, 145.0), (-28.0, 153.0), (-20.0, 149.0), (-12.0, 131.0)],
-    // Greenland
-    &[(60.0, -45.0), (70.0, -55.0), (78.0, -35.0), (70.0, -20.0), (60.0, -45.0)],
-];
-
-fn draw_continents(painter: &Painter, rect: Rect) {
-    let stroke = egui::Stroke::new(1.2, Color32::from_rgb(90, 100, 115));
-    let fill = Color32::from_rgb(50, 58, 70);
-    for poly in CONTINENTS {
-        let pts: Vec<Pos2> = poly
-            .iter()
-            .filter_map(|(lat, lon)| project(rect, *lat, *lon))
-            .collect();
-        if pts.len() > 2 {
-            painter.add(egui::Shape::convex_polygon(pts, fill, stroke));
-        } else if pts.len() > 1 {
-            painter.line_segment([pts[0], pts[1]], stroke);
+/// Real coastlines from embedded Natural Earth 110m data.
+fn draw_coastlines(painter: &Painter, rect: Rect) {
+    let stroke = Stroke::new(1.1, Color32::from_rgb(120, 150, 120));
+    for poly in earth::coastlines() {
+        let mut prev: Option<Pos2> = None;
+        for (lat, lon) in poly {
+            let cur = project(rect, *lat, *lon);
+            if let (Some(a), Some(b)) = (prev, cur) {
+                // Skip segments that wrap the antimeridian.
+                if (b.x - a.x).abs() < rect.width() / 2.0 {
+                    painter.line_segment([a, b], stroke);
+                }
+            }
+            prev = cur;
         }
     }
 }

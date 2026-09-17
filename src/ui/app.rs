@@ -104,13 +104,18 @@ impl App {
                 ui.separator();
                 ui.label("Layout:");
                 for l in Layout::ALL {
-                    if ui
-                        .selectable_label(self.layout == l, l.label())
-                        .clicked()
-                    {
+                    if ui.selectable_label(self.layout == l, l.label()).clicked() {
                         self.layout = l;
                         self.panes = (0..l.pane_count())
-                            .map(|i| self.panes.get(i).cloned().unwrap_or_default())
+                            .map(|i| {
+                                self.panes.get(i).cloned().map(|mut p| {
+                                    if i == 0 && p.view == ViewKind::WorldMap {
+                                        p.view = ViewKind::Globe3D;
+                                    }
+                                    p
+                                })
+                                .unwrap_or_default()
+                            })
                             .collect();
                         self.active_pane = 0;
                     }
@@ -189,6 +194,36 @@ impl App {
 
                     let mut child = panes::pane_ui_at(ui, content);
                     match pane.view {
+                        ViewKind::Globe3D => {                            // Interaction: drag to rotate, scroll to zoom.
+                            let resp = child.allocate_rect(child.max_rect(), egui::Sense::click_and_drag());
+                            if resp.dragged() {
+                                self.panes[i].globe.drag(resp.drag_delta());
+                            }
+                            if let Some(hover) = resp.hover_pos() {
+                                let scroll = child.input(|i| i.smooth_scroll_delta.y);
+                                if scroll != 0.0 && child.max_rect().contains(hover) {
+                                    self.panes[i].globe.zoom(1.0 + scroll / 600.0);
+                                }
+                            }
+
+                            let focus_sat = pane
+                                .focus_norad
+                                .and_then(|n| self.sat_by_norad(n));
+                            let focus_orbit = focus_sat.as_ref().map(|sat| {
+                                self.prop.ground_track(sat, chrono::Utc::now(), -95.0, 95.0, 3.0)
+                            }).unwrap_or_default();
+                            let painter = child.painter().clone();
+                            views::globe3d::show_globe(
+                                &painter,
+                                child.max_rect(),
+                                &self.panes[i].globe,
+                                &sats,
+                                &positions,
+                                focus_sat.as_ref(),
+                                &focus_orbit,
+                                &self.groups_enabled,
+                            );
+                        }
                         ViewKind::WorldMap => {
                             let painter = child.painter().clone();
                             views::show_world_map(
@@ -197,6 +232,7 @@ impl App {
                                 &sats,
                                 &positions,
                                 &self.groups_enabled,
+                                self.selected,
                             );
                         }
                         ViewKind::GroundTrack => {
@@ -235,11 +271,10 @@ impl App {
                         }
                     }
 
-                    // View picker: click the "⇄" hotspot in the pane's title bar to cycle views.
-                    if picker_clicked(ctx, pixels) {
-                        let all = ViewKind::ALL;
-                        let idx = all.iter().position(|v| *v == pane.view).unwrap_or(0);
-                        self.panes[i].view = all[(idx + 1) % all.len()];
+                    // 3D/2D switch in the pane's top-right corner.
+                    let switched = view_toggle(ctx, pixels, pane.view);
+                    if let Some(new_view) = switched {
+                        self.panes[i].view = new_view;
                     }
                 }
             });
@@ -247,29 +282,48 @@ impl App {
 }
 
 /// Invisible click hotspot in the pane's top-right corner to cycle views.
-fn picker_clicked(ctx: &egui::Context, pane_rect: egui::Rect) -> bool {
-    let rect = egui::Rect::from_min_size(
-        egui::Pos2::new(pane_rect.max.x - 30.0, pane_rect.min.y + 2.0),
-        egui::Vec2::new(26.0, 14.0),
-    );
-    let id = egui::Id::new("picker");
+/// 3D/2D toggle buttons in the pane's top-right title bar.
+fn view_toggle(ctx: &egui::Context, pane_rect: egui::Rect, current: ViewKind) -> Option<ViewKind> {
+    let y = pane_rect.min.y + 2.0;
+    let btn = |x: f32, label: &'static str, target: ViewKind| -> (egui::Rect, bool, bool) {
+        let rect = egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(28.0, 14.0));
+        let mouse_in = ctx
+            .input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
+        let clicked = mouse_in && ctx.input(|i| i.pointer.any_click());
+        let active = current == target;
+        (rect, active, clicked)
+    };
+
+    let b3 = btn(pane_rect.max.x - 62.0, "3D", ViewKind::Globe3D);
+    let b2 = btn(pane_rect.max.x - 32.0, "2D", ViewKind::WorldMap);
+
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
-        egui::Id::new("picker-layer"),
+        egui::Id::new("view-toggle-layer"),
     ));
-    let clicked = ctx.input(|i| i.pointer.any_click())
-        && ctx.input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "⇄",
-        egui::FontId::proportional(11.0),
-        if ctx.input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p))) {
-            egui::Color32::WHITE
-        } else {
-            egui::Color32::from_rgb(140, 140, 150)
-        },
-    );
-    let _ = id;
-    clicked
+    for (rect, active, _) in [b3, b2] {
+        painter.rect_filled(
+            rect,
+            3.0,
+            if active {
+                egui::Color32::from_rgb(70, 110, 180)
+            } else {
+                egui::Color32::from_rgb(55, 58, 66)
+            },
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if std::ptr::eq(&rect, &b3.0) { "3D" } else { "2D" },
+            egui::FontId::proportional(10.0),
+            if active { egui::Color32::WHITE } else { egui::Color32::from_rgb(160, 160, 170) },
+        );
+    }
+    if b3.2 {
+        Some(ViewKind::Globe3D)
+    } else if b2.2 {
+        Some(ViewKind::WorldMap)
+    } else {
+        None
+    }
 }

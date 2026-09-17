@@ -2,6 +2,10 @@
 
 use egui::{Color32, Pos2, Rect, Stroke, Ui, Vec2};
 
+pub mod globe3d {
+    pub use crate::ui::views::globe3d::GlobeState;
+}
+
 /// How many panes and their rects within the content area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
@@ -62,6 +66,8 @@ impl Layout {
 /// What a pane displays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewKind {
+    /// 3D interactive globe with live satellites and orbit ring.
+    Globe3D,
     /// 3D-ish orbit globe (equirectangular map with ground tracks).
     WorldMap,
     /// Ground track of one focused satellite.
@@ -73,7 +79,8 @@ pub enum ViewKind {
 }
 
 impl ViewKind {
-    pub const ALL: [ViewKind; 4] = [
+    pub const ALL: [ViewKind; 5] = [
+        ViewKind::Globe3D,
         ViewKind::WorldMap,
         ViewKind::GroundTrack,
         ViewKind::Catalog,
@@ -82,6 +89,7 @@ impl ViewKind {
 
     pub fn label(self) -> &'static str {
         match self {
+            ViewKind::Globe3D => "3D Globe",
             ViewKind::WorldMap => "World Map",
             ViewKind::GroundTrack => "Ground Track",
             ViewKind::Catalog => "Catalog",
@@ -96,13 +104,16 @@ pub struct Pane {
     pub view: ViewKind,
     /// Selected NORAD id for GroundTrack / Detail views.
     pub focus_norad: Option<u32>,
+    /// Camera for the 3D globe view.
+    pub globe: globe3d::GlobeState,
 }
 
 impl Default for Pane {
     fn default() -> Self {
         Self {
-            view: ViewKind::WorldMap,
+            view: ViewKind::Globe3D,
             focus_norad: None,
+            globe: globe3d::GlobeState::default(),
         }
     }
 }
