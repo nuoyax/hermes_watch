@@ -106,9 +106,15 @@ pub struct Pane {
     pub focus_norad: Option<u32>,
     /// Camera for the 3D globe view.
     pub globe: globe3d::GlobeState,
-    /// Cached orbit ring: (norad, computed_at, points). Re-propagated only
-    /// when the satellite changes or the cache is > 30 s old.
-    pub orbit_cache: Option<(u32, std::time::Instant, Vec<[f64; 3]>)>,
+    /// Cached orbit ring: (norad, computed_at_wall, sim_time_centre, points).
+    /// Re-propagated when the satellite changes, the wall-clock cache is
+    /// stale, or the sim clock drifts too far from the ring's centre.
+    pub orbit_cache: Option<(
+        u32,
+        std::time::Instant,
+        chrono::DateTime<chrono::Utc>,
+        Vec<[f64; 3]>,
+    )>,
 }
 
 impl Default for Pane {

@@ -89,27 +89,39 @@ impl App {
         self.catalog.read().iter().find(|s| s.norad_id == norad).cloned()
     }
 
-    /// Recompute this pane's orbit ring only when the satellite changed or
-    /// enough time has passed — SGP4 propagation over ±95 min is expensive
-    /// and was redone every frame for every pane.
+    /// Recompute this pane's orbit ring only when the satellite changed, the
+    /// wall-clock cache is stale, or the sim clock drifted too far from the
+    /// ring's centre — SGP4 propagation over ±95 min is expensive and was
+    /// redone every frame for every pane. The ring is propagated around the
+    /// sim time so the satellite marker always rides on it (with the sim
+    /// clock accelerated, wall-time caching would leave it stranded).
     fn ensure_orbit(
         pane: &mut Pane,
         prop: &mut Propagator,
         sat: &Sat,
+        sim_time: chrono::DateTime<chrono::Utc>,
     ) -> Vec<[f64; 3]> {
         let fresh = pane
             .orbit_cache
             .as_ref()
-            .is_some_and(|(norad, t, _)| *norad == sat.norad_id && t.elapsed().as_secs_f64() < 30.0);
+            .is_some_and(|(norad, t, centre, _)| {
+                *norad == sat.norad_id
+                    && t.elapsed().as_secs_f64() < 30.0
+                    && (sim_time - *centre).num_seconds().abs() < 120
+            });
         if !fresh {
-            // True inertial orbit: one full revolution centred on now,
-            // smooth (94 points over ~95 min for LEO).
+            // True inertial orbit: one full revolution centred on the sim
+            // time, smooth (94 points over ~95 min for LEO).
             let period_hint = 95.0; // minutes of half revolution — covers LEO..MEO nicely
-            let track =
-                prop.orbit_eci(sat, chrono::Utc::now(), -period_hint, period_hint, 2.0);
-            pane.orbit_cache = Some((sat.norad_id, std::time::Instant::now(), track));
+            let track = prop.orbit_eci(sat, sim_time, -period_hint, period_hint, 2.0);
+            pane.orbit_cache = Some((
+                sat.norad_id,
+                std::time::Instant::now(),
+                sim_time,
+                track,
+            ));
         }
-        pane.orbit_cache.as_ref().unwrap().2.clone()
+        pane.orbit_cache.as_ref().unwrap().3.clone()
     }
 }
 
@@ -426,7 +438,7 @@ impl App {
                                 Some(sat) => {
                                     let mut pane = self.panes[i].clone();
                                     let points =
-                                        Self::ensure_orbit(&mut pane, &mut self.prop, sat);
+                                        Self::ensure_orbit(&mut pane, &mut self.prop, sat, now);
                                     self.panes[i].orbit_cache = pane.orbit_cache;
                                     points
                                 }

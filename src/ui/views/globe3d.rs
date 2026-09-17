@@ -22,6 +22,9 @@ pub struct GlobeState {
     /// When set, the camera tracks this Earth-fixed longitude: the location
     /// stays facing the viewer as the Earth turns underneath (real rotation).
     pub lock_lon: Option<f64>,
+    /// Effective yaw of the last rendered frame — lets a drag that releases
+    /// the follow-lock continue smoothly from where the camera actually was.
+    pub current_yaw: f64,
 }
 
 impl Default for GlobeState {
@@ -32,6 +35,7 @@ impl Default for GlobeState {
             zoom: 150.0,
             last_interaction: None,
             lock_lon: None,
+            current_yaw: 0.0,
         }
     }
 }
@@ -41,6 +45,11 @@ impl GlobeState {
         self.yaw += delta.x as f64 * 0.01;
         self.pitch = (self.pitch + delta.y as f64 * 0.01).clamp(-1.5, 1.5);
         self.last_interaction = Some(std::time::Instant::now());
+        if self.lock_lon.is_some() {
+            // Releasing the follow-lock: adopt the camera's actual heading so
+            // the view doesn't snap back to the stale manual yaw.
+            self.yaw = self.current_yaw;
+        }
         self.lock_lon = None; // manual drag releases the follow-lock
     }
     pub fn zoom(&mut self, factor: f32) {
@@ -167,6 +176,7 @@ pub fn show_globe(
     let scale = (r / 150.0).clamp(0.25, 3.5);
     let now = std::time::Instant::now();
     let yaw = cam.effective_yaw(now, earth_rot);
+    cam.current_yaw = yaw; // remember for a smooth release of the follow-lock
     let pitch = cam.pitch;
 
     // Deep space + atmosphere limb.
