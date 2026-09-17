@@ -103,7 +103,14 @@ impl Earth {
         let handle = ctx.load_texture(
             "earth-day",
             egui::ColorImage { size, pixels },
-            egui::TextureOptions::LINEAR,
+            // Mipmaps are essential: a 2048x1024 texture minified onto a few
+            // hundred px sphere without them aliases into diagonal stripes.
+            egui::TextureOptions {
+                magnification: egui::TextureFilter::Linear,
+                minification: egui::TextureFilter::Linear,
+                mipmap_mode: Some(egui::TextureFilter::Linear),
+                ..Default::default()
+            },
         );
         self.tex = Some(handle.clone());
         handle
@@ -242,10 +249,9 @@ pub fn show_globe(
         let cam_v = rotate_to_cam(n, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         if let Some((a, az)) = prev {
-            let fade = if az > 0.0 && cur.1 > 0.0 { 1.0 } else { 0.35 };
+            let fade = if az > 0.0 && cur.1 > 0.0 { 1.0 } else { 0.45 };
             let white = Color32::WHITE;
-            painter.line_segment([a, cur.0], Stroke::new(5.0, blend(white, 0.30 * fade)));
-            painter.line_segment([a, cur.0], Stroke::new(2.0, blend(white, fade)));
+            painter.line_segment([a, cur.0], Stroke::new(2.5, blend(white, fade)));
         }
         prev = Some(cur);
     }
