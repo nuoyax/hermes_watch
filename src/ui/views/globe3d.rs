@@ -32,7 +32,7 @@ impl Default for GlobeState {
         Self {
             yaw: 0.0,
             pitch: 0.35,
-            zoom: 150.0,
+            zoom: 100.0,
             last_interaction: None,
             lock_lon: None,
             current_yaw: 0.0,
@@ -199,14 +199,21 @@ pub fn show_globe(
             let lon = -180.0 + 360.0 * lo as f64 / lon_bands as f64;
             // Surface normal in Earth-fixed frame (with GMST rotation applied,
             // since the texture is Earth-fixed too — camera spin comes from yaw).
+            // Geometry normal carries GMST (Earth-fixed texture in world frame).
             let (la_r, lo_r) = (lat.to_radians(), (lon + earth_rot.to_degrees()).to_radians());
             let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+            // Lighting normal stays in the EARTH-FIXED frame (no GMST): the
+            // sun direction is Earth-fixed too, so the day/night pattern is
+            // glued to the geography and completely independent of the
+            // camera yaw — dragging can never change the lighting.
+            let lo_ef = lon.to_radians();
+            let n_ef = V3(la_r.cos() * lo_ef.cos(), la_r.sin(), la_r.cos() * lo_ef.sin());
             let cam_v = rotate_to_cam(n, r as f64, yaw, pitch);
             let (pos, _z) = project(cam_v, center);
 
             // Lighting: sun in camera frame vs surface normal in camera frame.
             let sun_cam = rotate_to_cam(sun_dir_ef, 1.0, yaw, pitch);
-            let n_cam = rotate_to_cam(n, 1.0, yaw, pitch);
+            let n_cam = rotate_to_cam(n_ef, 1.0, yaw, pitch);
             let d = n_cam.dot(sun_cam).clamp(0.0, 1.0);
             let shade = 0.10 + 0.92 * d;
             let c = Color32::from_rgba_unmultiplied(
@@ -272,7 +279,7 @@ pub fn show_globe(
         let alt = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - 6371.0;
         // Moderate exaggeration: the ring stays fully inside the pane while
         // LEO orbits still clear the surface (displayed km values stay true).
-        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.30);
+        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.50);
         let cam_v = rotate_to_cam(v, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         // Occlusion: a point is hidden when it's on the far side (z < 0) AND
@@ -292,7 +299,7 @@ pub fn show_globe(
     if let Some(p) = sat_pos {
         // Same exaggerated altitude scaling as the orbit ring — so the
         // marker rides exactly on the ring (displayed km values stay true).
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.30);
+        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.50);
         let (la_r, lo_r) = (
             p.lat_deg.to_radians(),
             (p.lon_deg + earth_rot.to_degrees()).to_radians(),
@@ -371,12 +378,10 @@ fn blend(c: Color32, alpha: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (255.0 * alpha) as u8)
 }
 
-/// Sun direction in the WORLD (inertial) frame (unit vector) at `time`:
-/// points from Earth's center toward the subsolar point. The Earth mesh
-/// bakes +GMST into its vertex longitudes (Earth-fixed texture in a world
-/// frame), so the sun must live in that same world frame — subsolar
-/// longitude PLUS GMST — otherwise the lit hemisphere would rotate with
-/// the Earth and the terminator would never move across the surface.
+/// Sun direction in the EARTH-FIXED frame (unit vector) at `time`: points
+/// from Earth's center toward the subsolar point. Lighting is done entirely
+/// in this frame (normals without the GMST term), so the day/night pattern
+/// is fixed to the geography and can never shift when the user drags.
 pub fn sun_direction(time: DateTime<Utc>) -> V3 {
     // Subsolar point: latitude = solar declination, longitude = where local
     // solar noon is right now (UTC hour angle).
@@ -385,7 +390,7 @@ pub fn sun_direction(time: DateTime<Utc>) -> V3 {
     let utc_hours =
         time.hour() as f64 + time.minute() as f64 / 60.0 + time.second() as f64 / 3600.0;
     // Subsolar longitude: −15° per hour from local noon (12:00 UTC → 0°).
-    let subsolar_lon = -15.0 * (utc_hours - 12.0) + gmst_deg(time);
+    let subsolar_lon = -15.0 * (utc_hours - 12.0);
 
     let (la, lo) = (decl_deg.to_radians(), subsolar_lon.to_radians());
     V3(la.cos() * lo.cos(), la.sin(), la.cos() * lo.sin())
