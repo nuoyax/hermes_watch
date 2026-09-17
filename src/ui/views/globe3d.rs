@@ -25,6 +25,8 @@ pub struct GlobeState {
     /// Effective yaw of the last rendered frame — lets a drag that releases
     /// the follow-lock continue smoothly from where the camera actually was.
     pub current_yaw: f64,
+    /// Last manual drag — 5 s of idleness after it triggers an auto-reset.
+    pub last_drag: Option<std::time::Instant>,
 }
 
 impl Default for GlobeState {
@@ -36,6 +38,7 @@ impl Default for GlobeState {
             last_interaction: None,
             lock_lon: None,
             current_yaw: 0.0,
+            last_drag: None,
         }
     }
 }
@@ -45,6 +48,7 @@ impl GlobeState {
         self.yaw += delta.x as f64 * 0.01;
         self.pitch = (self.pitch + delta.y as f64 * 0.01).clamp(-1.5, 1.5);
         self.last_interaction = Some(std::time::Instant::now());
+        self.last_drag = self.last_interaction;
         if self.lock_lon.is_some() {
             // Releasing the follow-lock: adopt the camera's actual heading so
             // the view doesn't snap back to the stale manual yaw.
@@ -81,6 +85,28 @@ impl GlobeState {
             return self.yaw;
         }
         self.yaw
+    }
+
+    /// Auto-reset: 5 s after the last manual drag, ease the camera back to
+    /// the default view (default pitch; follow-lock yaw if one is active,
+    /// otherwise the neutral yaw the free camera had before the drag).
+    pub fn auto_reset(&mut self, base_yaw: f64) {
+        const IDLE_RESET: f64 = 5.0;
+        let idle = self
+            .last_drag
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(f64::INFINITY);
+        if idle < IDLE_RESET {
+            return;
+        }
+        if self.pitch != Self::default().pitch || self.yaw != base_yaw {
+            let k = ((idle - IDLE_RESET) * 3.0).clamp(0.0, 1.0) as f32; // ~1/3 s ease
+            self.pitch += (Self::default().pitch - self.pitch) * k as f64;
+            self.yaw += (base_yaw - self.yaw) * k as f64;
+        }
+        if idle > IDLE_RESET + 1.0 {
+            self.last_drag = None; // settled — stop easing
+        }
     }
 }
 
@@ -175,11 +201,15 @@ pub fn show_globe(
     // model, orbit line, labels) scales together with the zoom level.
     let scale = (r / 150.0).clamp(0.25, 3.5);
     let now = std::time::Instant::now();
+    // 5 s after the last drag, ease back to the default view.
+    cam.auto_reset(0.0);
     let yaw = cam.effective_yaw(now, earth_rot);
     cam.current_yaw = yaw; // remember for a smooth release of the follow-lock
     let pitch = cam.pitch;
 
-    // Deep space + atmosphere limb.
+    // Deep space + atmosphere limb. Painting is clipped to the pane rect so
+    // multi-pane layouts never bleed into neighbouring panes.
+    let painter = painter.with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, Color32::from_rgb(6, 8, 14));
     painter.circle_filled(center, r + 6.0, Color32::from_rgba_unmultiplied(90, 140, 220, 45));
     painter.circle_filled(center, r + 2.0, Color32::from_rgb(80, 120, 190));
