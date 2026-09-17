@@ -162,6 +162,9 @@ pub fn show_globe(
 ) {
     let center = rect.center();
     let r = cam.zoom;
+    // Whole-scene scale: everything except the backdrop (globe, satellite
+    // model, orbit line, labels) scales together with the zoom level.
+    let scale = (r / 150.0).clamp(0.25, 3.5);
     let now = std::time::Instant::now();
     let yaw = cam.effective_yaw(now, earth_rot);
     let pitch = cam.pitch;
@@ -270,8 +273,8 @@ pub fn show_globe(
         let visible = cur.1 > 0.0 || cur.0.distance(center) > r;
         if let Some((a, az)) = prev {
             if az && visible {
-                painter.line_segment([a, cur.0], Stroke::new(2.5, blend(Color32::WHITE, 0.10)));
-                painter.line_segment([a, cur.0], Stroke::new(0.6, blend(Color32::WHITE, 0.80)));
+                painter.line_segment([a, cur.0], Stroke::new(2.5 * scale as f32, blend(Color32::WHITE, 0.10)));
+                painter.line_segment([a, cur.0], Stroke::new((0.6 * scale as f32).max(0.4), blend(Color32::WHITE, 0.80)));
             }
         }
         prev = Some((cur.0, visible));
@@ -290,12 +293,12 @@ pub fn show_globe(
         let (sp, z) = project(cam_v, center);
         let behind = z < 0.0 && sp.distance(center) < r;
         if !behind {
-            draw_satellite_model(&painter, sp, center, color);
+            draw_satellite_model(&painter, sp, center, color, scale as f32);
             painter.text(
-                sp + Vec2::new(14.0, -12.0),
+                sp + Vec2::new(14.0 * scale as f32, -12.0 * scale as f32),
                 egui::Align2::LEFT_BOTTOM,
                 format!("{} · {} km", sat.name, p.alt_km as i32),
-                egui::FontId::proportional(11.0),
+                egui::FontId::proportional((11.0 * scale as f32).max(9.0)),
                 Color32::WHITE,
             );
         }
@@ -305,18 +308,18 @@ pub fn show_globe(
 /// Draw a small satellite pictogram at `sp`: central body box + two solar
 /// panel wings + a thin truss, tilted to point at the Earth's center (like
 /// the standard satellite icon). Glow underneath keeps it readable.
-fn draw_satellite_model(painter: &Painter, sp: Pos2, center: Pos2, color: Color32) {
+fn draw_satellite_model(painter: &Painter, sp: Pos2, center: Pos2, color: Color32, scale: f32) {
     // Orientation: the satellite's panels face perpendicular to the line to
     // Earth; rotate the icon so "down" points at the globe center.
     let to_earth = (center - sp).normalized();
     let ang = to_earth.y.atan2(to_earth.x) - std::f32::consts::FRAC_PI_2;
     let rot = |v: Vec2| -> Vec2 {
         let (s, c) = ang.sin_cos();
-        Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+        Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c) * scale
     };
 
     // Soft glow so the icon reads on both bright and dark ground.
-    painter.circle_filled(sp, 12.0, blend(color, 0.25));
+    painter.circle_filled(sp, 12.0 * scale, blend(color, 0.25));
 
     // Solar panels: dark blue rectangles with cell lines, one on each side.
     let panel = |side: f32| {
@@ -352,7 +355,7 @@ fn draw_satellite_model(painter: &Painter, sp: Pos2, center: Pos2, color: Color3
     // Dish antenna pointing at Earth.
     let tip = sp + rot(Vec2::new(0.0, 8.0));
     painter.line_segment([sp, tip], Stroke::new(1.0, Color32::from_rgb(200, 205, 215)));
-    painter.circle_filled(tip, 1.6, Color32::WHITE);
+    painter.circle_filled(tip, 1.6 * scale, Color32::WHITE);
 }
 
 fn blend(c: Color32, alpha: f32) -> Color32 {
