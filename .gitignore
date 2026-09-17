@@ -1,0 +1,7 @@
+/target
+.claude/
+CLAUDE.md
+.mcp.json
+.claudeignore
+memory/
+*.log

@@ -1,0 +1,33 @@
+[package]
+name = "sat_monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Native UI + rendering
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui_extras = { version = "0.29", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Async data fetching
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# SGP4 propagation
+sgp4 = "2.2"
+
+# Utility
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+egui = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
