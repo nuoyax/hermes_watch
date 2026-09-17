@@ -218,6 +218,18 @@ pub fn show_globe(
     painter.circle_filled(center, r, Color32::from_rgb(10, 14, 20));
 
     // === Textured sphere as a triangle mesh with per-vertex UV + shading ===
+    // Sun is fixed in INERTIAL space (a real direction the light comes
+    // from): rotate the earth-fixed sun vector by GMST into the world frame
+    // (same Y-axis rotation the mesh normals use). Dragging the globe
+    // rotates the lit hemisphere together with the Earth, instantly.
+    let g = earth_rot;
+    let (sg, cg) = g.sin_cos();
+    let sun_world = V3(
+        sun_dir_ef.0 * cg + sun_dir_ef.2 * sg,
+        sun_dir_ef.1,
+        -sun_dir_ef.0 * sg + sun_dir_ef.2 * cg,
+    );
+    let sun_norm = sun_world.dot(sun_world).sqrt();
     let tex = earth.texture(painter.ctx());
     let (lat_bands, lon_bands) = (48usize, 96usize);
     let mut vertices: Vec<egui::epaint::Vertex> = Vec::new();
@@ -232,21 +244,14 @@ pub fn show_globe(
             // Geometry normal carries GMST (Earth-fixed texture in world frame).
             let (la_r, lo_r) = (lat.to_radians(), (lon + earth_rot.to_degrees()).to_radians());
             let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
-            // Lighting normal stays in the EARTH-FIXED frame (no GMST): the
-            // sun direction is Earth-fixed too, so the day/night pattern is
-            // glued to the geography and completely independent of the
-            // camera yaw — dragging can never change the lighting.
-            let lo_ef = lon.to_radians();
-            let n_ef = V3(la_r.cos() * lo_ef.cos(), la_r.sin(), la_r.cos() * lo_ef.sin());
             let cam_v = rotate_to_cam(n, r as f64, yaw, pitch);
             let (pos, _z) = project(cam_v, center);
 
-            // Lighting is VIEW-RELATIVE: the sun sits behind the viewer's
-            // upper-left shoulder in CAMERA space, so no matter how the user
-            // drags or how the Earth spins, the visible face is always lit.
-            let sun_cam = V3(-0.45, 0.50, 1.0);
-            let n_cam = rotate_to_cam(n_ef, 1.0, yaw, pitch);
-            let d = n_cam.dot(sun_cam).clamp(0.0, 1.0) / sun_cam.dot(sun_cam).sqrt();
+            // Lighting: sun fixed in the WORLD (inertial) frame, normal in
+            // the same world frame as the mesh geometry — dragging spins the
+            // whole lit pattern with the Earth, with zero lag.
+            let n_world = n; // mesh normal already includes the GMST term
+            let d = n_world.dot(sun_world).clamp(0.0, 1.0) / sun_norm;
             let shade = 0.10 + 0.92 * d;
             let c = Color32::from_rgba_unmultiplied(
                 (255.0 * shade) as u8,
