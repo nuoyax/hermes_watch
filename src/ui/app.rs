@@ -65,6 +65,25 @@ impl App {
     fn sat_by_norad(&self, norad: u32) -> Option<Sat> {
         self.catalog.read().iter().find(|s| s.norad_id == norad).cloned()
     }
+
+    /// Recompute this pane's orbit ring only when the satellite changed or
+    /// enough time has passed — SGP4 propagation over ±95 min is expensive
+    /// and was redone every frame for every pane.
+    fn ensure_orbit(
+        pane: &mut Pane,
+        prop: &mut Propagator,
+        sat: &Sat,
+    ) -> Vec<crate::orbit::GeoPoint> {
+        let fresh = pane
+            .orbit_cache
+            .as_ref()
+            .is_some_and(|(norad, t, _)| *norad == sat.norad_id && t.elapsed().as_secs_f64() < 30.0);
+        if !fresh {
+            let track = prop.ground_track(sat, chrono::Utc::now(), -95.0, 95.0, 3.0);
+            pane.orbit_cache = Some((sat.norad_id, std::time::Instant::now(), track));
+        }
+        pane.orbit_cache.as_ref().unwrap().2.clone()
+    }
 }
 
 impl eframe::App for App {
@@ -99,7 +118,8 @@ impl eframe::App for App {
                 std::mem::forget(rx);
             });
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+        // Continuous repaint: smooth globe drag + live satellite motion.
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
         self.top_bar(ctx);
         self.sidebar(ctx);
@@ -219,7 +239,9 @@ impl App {
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(16, 18, 22)))
             .show(ctx, |ui| {
                 let area = ui.available_rect_before_wrap();
-                let sats = self.catalog.read().clone();
+                // Borrow the catalog instead of cloning 16k sats every frame.
+                let catalog_guard = self.catalog.read();
+                let sats: &Vec<Sat> = &catalog_guard;
 
                 for (i, norm_rect) in self.layout.panes().into_iter().enumerate() {
                     let pixels = egui::Rect::from_min_size(
@@ -266,11 +288,19 @@ impl App {
                                 }
                             }
 
-                            // Only the focused satellite + its orbit ring.
+                            // Only the focused satellite + its orbit ring
+                            // (propagation cached per pane — see focus_orbit_cached).
                             let now = chrono::Utc::now();
-                            let focus_orbit = focus_sat.as_ref().map(|sat| {
-                                self.prop.ground_track(sat, now, -95.0, 95.0, 3.0)
-                            }).unwrap_or_default();
+                            let focus_orbit = match &focus_sat {
+                                Some(sat) => {
+                                    let mut pane = self.panes[i].clone();
+                                    let points =
+                                        Self::ensure_orbit(&mut pane, &mut self.prop, sat);
+                                    self.panes[i].orbit_cache = pane.orbit_cache;
+                                    points
+                                }
+                                None => Vec::new(),
+                            };
                             let focus_pos = focus_sat.as_ref().and_then(|sat| {
                                 self.prop.subpoint(sat, now)
                             });

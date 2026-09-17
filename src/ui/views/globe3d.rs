@@ -163,6 +163,9 @@ pub fn show_globe(
     painter.rect_filled(rect, 0.0, Color32::from_rgb(6, 8, 14));
     painter.circle_filled(center, r + 6.0, Color32::from_rgba_unmultiplied(90, 140, 220, 45));
     painter.circle_filled(center, r + 2.0, Color32::from_rgb(80, 120, 190));
+    // Opaque sphere interior: the mesh never fully covers the disc near the
+    // silhouette, so without this the blue limb shows through as stripes.
+    painter.circle_filled(center, r, Color32::from_rgb(10, 14, 20));
 
     // === Textured sphere as a triangle mesh with per-vertex UV + shading ===
     let tex = earth.texture(painter.ctx());
@@ -239,9 +242,10 @@ pub fn show_globe(
         let cam_v = rotate_to_cam(n, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         if let Some((a, az)) = prev {
-            let fade = if az > 0.0 && cur.1 > 0.0 { 0.95 } else { 0.28 };
-            painter.line_segment([a, cur.0], Stroke::new(4.0, blend(color, 0.20 * fade)));
-            painter.line_segment([a, cur.0], Stroke::new(1.6, blend(color, fade)));
+            let fade = if az > 0.0 && cur.1 > 0.0 { 1.0 } else { 0.35 };
+            let white = Color32::WHITE;
+            painter.line_segment([a, cur.0], Stroke::new(5.0, blend(white, 0.30 * fade)));
+            painter.line_segment([a, cur.0], Stroke::new(2.0, blend(white, fade)));
         }
         prev = Some(cur);
     }

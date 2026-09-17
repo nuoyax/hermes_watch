@@ -106,6 +106,9 @@ pub struct Pane {
     pub focus_norad: Option<u32>,
     /// Camera for the 3D globe view.
     pub globe: globe3d::GlobeState,
+    /// Cached orbit ring: (norad, computed_at, points). Re-propagated only
+    /// when the satellite changes or the cache is > 30 s old.
+    pub orbit_cache: Option<(u32, std::time::Instant, Vec<crate::orbit::GeoPoint>)>,
 }
 
 impl Default for Pane {
@@ -114,6 +117,7 @@ impl Default for Pane {
             view: ViewKind::Globe3D,
             focus_norad: None,
             globe: globe3d::GlobeState::default(),
+            orbit_cache: None,
         }
     }
 }
