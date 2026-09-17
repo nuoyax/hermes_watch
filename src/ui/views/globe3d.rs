@@ -241,10 +241,12 @@ pub fn show_globe(
             let cam_v = rotate_to_cam(n, r as f64, yaw, pitch);
             let (pos, _z) = project(cam_v, center);
 
-            // Lighting: sun in camera frame vs surface normal in camera frame.
-            let sun_cam = rotate_to_cam(sun_dir_ef, 1.0, yaw, pitch);
+            // Lighting is VIEW-RELATIVE: the sun sits behind the viewer's
+            // upper-left shoulder in CAMERA space, so no matter how the user
+            // drags or how the Earth spins, the visible face is always lit.
+            let sun_cam = V3(-0.45, 0.50, 1.0);
             let n_cam = rotate_to_cam(n_ef, 1.0, yaw, pitch);
-            let d = n_cam.dot(sun_cam).clamp(0.0, 1.0);
+            let d = n_cam.dot(sun_cam).clamp(0.0, 1.0) / sun_cam.dot(sun_cam).sqrt();
             let shade = 0.10 + 0.92 * d;
             let c = Color32::from_rgba_unmultiplied(
                 (255.0 * shade) as u8,
@@ -309,7 +311,7 @@ pub fn show_globe(
         let alt = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - 6371.0;
         // Moderate exaggeration: the ring stays fully inside the pane while
         // LEO orbits still clear the surface (displayed km values stay true).
-        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.50);
+        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.75);
         let cam_v = rotate_to_cam(v, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         // Occlusion: a point is hidden when it's on the far side (z < 0) AND
@@ -329,7 +331,7 @@ pub fn show_globe(
     if let Some(p) = sat_pos {
         // Same exaggerated altitude scaling as the orbit ring — so the
         // marker rides exactly on the ring (displayed km values stay true).
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.50);
+        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.75);
         let (la_r, lo_r) = (
             p.lat_deg.to_radians(),
             (p.lon_deg + earth_rot.to_degrees()).to_radians(),
