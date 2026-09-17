@@ -2,11 +2,17 @@
 
 use crate::orbit::Propagator;
 use crate::data::model::Sat;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use egui::{Color32, Painter, Rect};
 
-pub fn show_ground_track(painter: &Painter, rect: Rect, sat: &Sat, prop: &Propagator) {
-    let now = Utc::now();
+pub fn show_ground_track(
+    painter: &Painter,
+    rect: Rect,
+    sat: &Sat,
+    prop: &Propagator,
+    sim_time: chrono::DateTime<chrono::Utc>,
+) {
+    let now = sim_time;
     let track = prop.ground_track(sat, now, 45.0, 90.0, 2.0);
 
     // Grid backdrop (reuse world map helpers).

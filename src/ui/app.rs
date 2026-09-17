@@ -33,6 +33,11 @@ pub struct App {
     pub groups_enabled: HashSet<SatGroup>,
     pub earth: crate::ui::views::globe3d::Earth,
     pub last_refresh: std::time::Instant,
+    /// Simulation clock (accelerated). Rendering & propagation use this.
+    pub sim_time: chrono::DateTime<chrono::Utc>,
+    /// Time-lapse multiplier (1 = real time).
+    pub speed: f64,
+    sim_last_frame: std::time::Instant,
     /// Catalog length at the time `catalog_snapshot` was taken (change marker).
     catalog_version: std::cell::Cell<usize>,
     /// Sidebar renders from this snapshot instead of cloning 16k sats/frame.
@@ -72,6 +77,9 @@ impl App {
             groups_enabled: SatGroup::ALL.iter().copied().collect(),
             earth: crate::ui::views::globe3d::Earth::load(),
             last_refresh: std::time::Instant::now(),
+            sim_time: chrono::Utc::now(),
+            speed: 60.0,
+            sim_last_frame: std::time::Instant::now(),
             catalog_version: std::cell::Cell::new(0),
             catalog_snapshot: std::cell::RefCell::new(Vec::new()),
         }
@@ -126,6 +134,15 @@ impl eframe::App for App {
             self.seed_default_sats();
         }
 
+        // Advance the simulation clock (accelerated time-lapse so Earth
+        // rotation and satellite motion are visible at a glance).
+        let now_sim = frame_start.elapsed();
+        let _ = now_sim;
+        let elapsed = self.sim_last_frame.elapsed().as_secs_f64().min(0.1);
+        self.sim_last_frame = frame_start;
+        self.sim_time += chrono::Duration::milliseconds((elapsed * self.speed * 1000.0) as i64);
+        let now = self.sim_time;
+
         // Periodic refresh every 2 h.
         if self.last_refresh.elapsed() > std::time::Duration::from_secs(2 * 3600) {
             self.last_refresh = std::time::Instant::now();
@@ -144,6 +161,7 @@ impl eframe::App for App {
 
         self.top_bar(ctx);
         self.settings_dialog(ctx);
+        self.sim_speed_bar(ctx);
         self.sidebar(ctx);
         self.content(ctx);
         let dt = frame_start.elapsed();
@@ -297,6 +315,32 @@ impl App {
         });
     }
 
+    /// Time-lapse speed control bar under the toolbar (×1 real time … ×1000).
+    fn sim_speed_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("sim_speed_bar")
+            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(20, 22, 28)).inner_margin(egui::Margin::symmetric(8.0, 2.0)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Time-lapse:");
+                    for (label, s) in [("×1", 1.0f64), ("×10", 10.0), ("×60", 60.0), ("×300", 300.0), ("×1000", 1000.0)] {
+                        if ui.selectable_label((self.speed - s).abs() < 0.01, label).clicked() {
+                            self.speed = s;
+                        }
+                    }
+                    ui.separator();
+                    // Recenter simulation clock to real time.
+                    if ui.small_button("⏱ Now").clicked() {
+                        self.sim_time = chrono::Utc::now();
+                    }
+                    ui.separator();
+                    ui.label(format!(
+                        "Sim UTC: {}",
+                        self.sim_time.format("%Y-%m-%d %H:%M:%S")
+                    ));
+                });
+            });
+    }
+
     fn sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("sidebar")
             .default_width(280.0)
@@ -377,7 +421,7 @@ impl App {
 
                             // Only the focused satellite + its orbit ring
                             // (propagation cached per pane — see focus_orbit_cached).
-                            let now = chrono::Utc::now();
+                            let now = self.sim_time;
                             let focus_orbit = match &focus_sat {
                                 Some(sat) => {
                                     let mut pane = self.panes[i].clone();
@@ -409,7 +453,7 @@ impl App {
                         ViewKind::WorldMap => {
                             let painter = child.painter().clone();
                             if let Some(sat) = &focus_sat {
-                                let pos = self.prop.subpoint(sat, chrono::Utc::now());
+                                let pos = self.prop.subpoint(sat, self.sim_time);
                                 if let Some(p) = &pos {
                                     views::show_world_map_full(&painter, child.max_rect(), sat, p);
                                 } else {
@@ -422,7 +466,13 @@ impl App {
                         ViewKind::GroundTrack => {
                             if let Some(sat) = &focus_sat {
                                 let painter = child.painter().clone();
-                                views::show_ground_track(&painter, child.max_rect(), sat, &self.prop);
+                                views::show_ground_track(
+                                    &painter,
+                                    child.max_rect(),
+                                    sat,
+                                    &self.prop,
+                                    self.sim_time,
+                                );
                             } else {
                                 child.vertical_centered(|ui| {
                                     ui.add_space(40.0);
