@@ -217,8 +217,8 @@ impl App {
                             views::globe3d::show_globe(
                                 &painter,
                                 child.max_rect(),
-                                &self.panes[i].globe,
-                                &self.earth,
+                                &mut self.panes[i].globe,
+                                &mut self.earth,
                                 sun_dir,
                                 earth_rot,
                                 focus_sat.as_ref(),
