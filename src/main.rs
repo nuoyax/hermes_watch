@@ -17,6 +17,9 @@ fn main() -> Result<()> {
         )
         .init();
 
+    // Local proxy for Celestrak (direct TLS revocation check fails offline).
+    std::env::set_var("SAT_PROXY", "http://127.0.0.1:7890");
+
     // Async runtime for fetching (runs on its own threads, not the UI thread).
     let runtime = Arc::new(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

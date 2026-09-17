@@ -70,14 +70,24 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain fetch messages.
+        let mut first_batch_done = false;
         while let Ok(FetchMsg::SourceDone { source, result }) = self.fetch_rx.try_recv() {
             match result {
-                Ok(n) => tracing::info!("{source}: {} sats", n.len()),
+                Ok(n) => {
+                    tracing::info!("{source}: {} sats", n.len());
+                    first_batch_done = true;
+                }
                 Err(e) => tracing::warn!("{source}: {e}"),
             }
         }
 
-        // Periodic refresh every 2 h + repaint at ~1 fps for orbit motion.
+        // First data arrived but no pane has a satellite yet: seed each pane
+        // with a well-known satellite so every window shows something.
+        if first_batch_done && self.panes.iter().all(|p| p.focus_norad.is_none()) {
+            self.seed_default_sats();
+        }
+
+        // Periodic refresh every 2 h.
         if self.last_refresh.elapsed() > std::time::Duration::from_secs(2 * 3600) {
             self.last_refresh = std::time::Instant::now();
             let status = Arc::clone(&self.status);
@@ -94,6 +104,55 @@ impl eframe::App for App {
         self.top_bar(ctx);
         self.sidebar(ctx);
         self.content(ctx);
+    }
+}
+
+impl App {
+    /// Give each pane a default satellite: prefer famous ones (ISS first),
+    /// then fall back to whatever is in the catalog. Deterministic, not random.
+    fn seed_default_sats(&mut self) {
+        const PREFERRED: &[&str] = &[
+            "ISS (ZARYA)", "CSS (TIANHE)", "HST", "NOAA 19",
+        ];
+        let catalog = self.catalog.read();
+        let mut picks: Vec<u32> = Vec::new();
+        for want in PREFERRED {
+            if let Some(sat) = catalog.iter().find(|s| s.name.contains(want)) {
+                picks.push(sat.norad_id);
+            }
+        }
+        // Fill remaining panes with distinct entries from interesting groups.
+        for sat in catalog.iter() {
+            if picks.len() >= self.panes.len() {
+                break;
+            }
+            if !picks.contains(&sat.norad_id)
+                && matches!(
+                    sat.group,
+                    crate::data::model::SatGroup::Station
+                        | crate::data::model::SatGroup::Navigation
+                        | crate::data::model::SatGroup::Weather
+                        | crate::data::model::SatGroup::Science
+                )
+            {
+                picks.push(sat.norad_id);
+            }
+        }
+        // Last resort: any entries.
+        for sat in catalog.iter() {
+            if picks.len() >= self.panes.len() {
+                break;
+            }
+            if !picks.contains(&sat.norad_id) {
+                picks.push(sat.norad_id);
+            }
+        }
+        drop(catalog);
+
+        for (pane, norad) in self.panes.iter_mut().zip(picks) {
+            pane.focus_norad = Some(norad);
+        }
+        self.selected = self.panes[0].focus_norad;
     }
 }
 

@@ -39,10 +39,20 @@ pub const SOURCES: &[Source] = &[
     },
 ];
 
-/// HTTP client with browser-like UA (Celestrak rejects default reqwest UA).
+/// HTTP client with browser-like UA. Uses the local proxy (127.0.0.1:7890)
+/// when direct connection fails — Celestrak/GitHub are unreachable directly
+/// from some networks (TLS revocation check fails offline).
 pub fn http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) sat-monitor/0.1")
-        .timeout(Duration::from_secs(30))
-        .build()?)
+        .timeout(Duration::from_secs(30));
+    if let Ok(proxy) = std::env::var("SAT_PROXY") {
+        if let Ok(p) = reqwest::Proxy::http(&proxy) {
+            builder = builder.proxy(p);
+        }
+        if let Ok(p) = reqwest::Proxy::https(&proxy) {
+            builder = builder.proxy(p);
+        }
+    }
+    Ok(builder.build()?)
 }
