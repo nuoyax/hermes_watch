@@ -189,6 +189,10 @@ impl App {
                     }
 
                     let mut child = panes::pane_ui_at(ui, content);
+                    // View lock buttons in the pane's title bar (jump globe to a
+                    // timezone's longitude).
+                    let tz_jumped = title_bar_buttons(ctx, pixels, &mut self.panes[i].globe);
+                    let _ = tz_jumped;
                     match pane.view {
                         ViewKind::Globe3D => {
                             // Interaction: drag to rotate, scroll to zoom.
@@ -282,9 +286,59 @@ impl App {
 }
 
 /// Invisible click hotspot in the pane's top-right corner to cycle views.
-/// 3D/2D toggle buttons in the pane's top-right title bar.
-fn view_toggle(ctx: &egui::Context, pane_rect: egui::Rect, current: ViewKind) -> Option<ViewKind> {
+/// Timezone quick-jump buttons drawn in the pane title bar (left of 3D/2D).
+/// Clicking rotates the globe so that region faces the viewer.
+fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut crate::ui::views::globe3d::GlobeState) -> bool {
+    // Buttons: 北京 (UTC+8, lon 116.4°E) / 华盛顿 (UTC-5, lon 77°W)
+    const ZONES: &[(&str, f64)] = &[("北京", 116.4), ("DC", -77.0)];
+    let mut jumped = false;
     let y = pane_rect.min.y + 2.0;
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("tz-buttons-layer"),
+    ));
+    let mut x = pane_rect.max.x - 62.0 - 4.0;
+    for (label, lon) in ZONES.iter().rev() {
+        let w = 30.0;
+        x -= w + 4.0;
+        let rect = egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(w, 14.0));
+        let mouse_in = ctx
+            .input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
+        let clicked = mouse_in && ctx.input(|i| i.pointer.any_click());
+        painter.rect_filled(
+            rect,
+            3.0,
+            if mouse_in {
+                egui::Color32::from_rgb(70, 90, 130)
+            } else {
+                egui::Color32::from_rgb(55, 58, 66)
+            },
+        );
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            *label,
+            egui::FontId::proportional(9.5),
+            egui::Color32::from_rgb(200, 205, 215),
+        );
+        if clicked {
+            // Face that longitude toward the viewer: camera yaw offset such that
+            // (lon + GMST rotation) ends up pointing at the camera (+z axis).
+            // In to_camera, yaw rotates world → cam; the point faces the viewer
+            // when its camera-space z is max, i.e. yaw = -(lon_rotated).
+            let now = chrono::Utc::now();
+            let gmst = crate::ui::views::globe3d::earth_rotation(now);
+            let lon_rot = lon.to_radians() + gmst;
+            globe.yaw = -lon_rot;
+            globe.last_interaction = Some(std::time::Instant::now());
+            jumped = true;
+        }
+    }
+    jumped
+}
+
+/// 3D/2D toggle buttons in the pane's top-right title bar.
+fn view_toggle(ctx: &egui::Context, pane_rect: egui::Rect, current: ViewKind) -> Option<ViewKind> {    let y = pane_rect.min.y + 2.0;
     let btn = |x: f32, label: &'static str, target: ViewKind| -> (egui::Rect, bool, bool) {
         let rect = egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(28.0, 14.0));
         let mouse_in = ctx
