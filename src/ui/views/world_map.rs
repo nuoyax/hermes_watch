@@ -1,74 +1,53 @@
-//! World map (2D equirectangular) view with real Natural Earth coastlines,
-//! graticule labels, satellite positions and hover tooltips.
+//! World map (2D equirectangular) view for ONE satellite: coastline earth,
+//! graticule labels, satellite position with label.
 
-use crate::data::model::{Sat, SatGroup};
+use crate::data::model::Sat;
 use crate::orbit::GeoPoint;
 use egui::{Color32, Painter, Pos2, Rect, Stroke};
 
 use crate::ui::earth;
 
-/// Render the world map view into `rect`. Returns hovered satellite index (if any).
+/// Render the world map view focused on one satellite.
 pub fn show_world_map(
     painter: &Painter,
     rect: Rect,
-    sats: &[Sat],
-    positions: &[Option<GeoPoint>],
-    groups_enabled: &std::collections::HashSet<SatGroup>,
-    selected: Option<u32>,
-) -> Option<usize> {
+    sat: Option<&Sat>,
+) -> Option<GeoPoint> {
     // Ocean background.
     painter.rect_filled(rect, 2.0, Color32::from_rgb(18, 28, 48));
+    draw_grid(painter, rect);
+    draw_coastlines(painter, rect);
+    sat.map(|_| ())?;
+    None // caller should use show_world_map_full when a satellite is focused
+}
 
+/// Full version with propagation — kept separate to avoid orbit dep cycles here.
+pub fn show_world_map_full(
+    painter: &Painter,
+    rect: Rect,
+    sat: &Sat,
+    pos: &GeoPoint,
+) -> Option<GeoPoint> {
+    painter.rect_filled(rect, 2.0, Color32::from_rgb(18, 28, 48));
     draw_grid(painter, rect);
     draw_coastlines(painter, rect);
 
-    // Satellites + hover detection.
-    let pointer = painter
-        .ctx()
-        .input(|i| i.pointer.latest_pos())
-        .filter(|p| rect.contains(*p));
-    let mut hovered = None;
-    let mut best = 12.0_f32;
-
-    for (idx, (sat, pos)) in sats.iter().zip(positions.iter()).enumerate() {
-        if !groups_enabled.contains(&sat.group) {
-            continue;
-        }
-        let Some(p) = pos else { continue };
-        let Some(spot) = project(rect, p.lat_deg, p.lon_deg) else {
-            continue;
-        };
-        let is_sel = selected == Some(sat.norad_id);
-        let radius = if is_sel { 5.0 } else { 3.0 };
-        painter.circle_filled(spot, radius, sat.group.color());
-        if is_sel {
-            painter.circle_stroke(spot, 8.0, Stroke::new(1.5, Color32::WHITE));
-        }
-        if let Some(mouse) = pointer {
-            let d = mouse.distance(spot);
-            if d < best {
-                best = d;
-                hovered = Some(idx);
-            }
-        }
-    }
-
-    // Tooltip for hovered satellite.
-    if let Some(idx) = hovered {
-        if let (Some(sat), Some(Some(p))) = (sats.get(idx), positions.get(idx)) {
-            if let Some(spot) = project(rect, p.lat_deg, p.lon_deg) {
-                painter.text(
-                    spot + egui::Vec2::new(10.0, -10.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    format!("{}\n#{} · {} km", sat.name, sat.norad_id, p.alt_km as i32),
-                    egui::FontId::proportional(11.0),
-                    Color32::WHITE,
-                );
-            }
-        }
-    }
-
-    hovered
+    let Some(spot) = project(rect, pos.lat_deg, pos.lon_deg) else {
+        return Some(*pos);
+    };
+    let color = sat.group.color();
+    // Glowing marker with white outline.
+    painter.circle_filled(spot, 9.0, blend(color, 0.30));
+    painter.circle_filled(spot, 4.5, color);
+    painter.circle_stroke(spot, 6.0, Stroke::new(1.5, Color32::WHITE));
+    painter.text(
+        spot + egui::Vec2::new(10.0, -10.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{}\n{} km", sat.name, pos.alt_km as i32),
+        egui::FontId::proportional(11.0),
+        Color32::WHITE,
+    );
+    Some(*pos)
 }
 
 /// Map lat/lon (deg) to pixel coords.
@@ -153,4 +132,8 @@ fn draw_coastlines(painter: &Painter, rect: Rect) {
             prev = cur;
         }
     }
+}
+
+fn blend(c: Color32, alpha: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (255.0 * alpha) as u8)
 }

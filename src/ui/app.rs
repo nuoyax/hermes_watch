@@ -26,7 +26,7 @@ pub struct App {
     pub filter: CatalogFilter,
     pub selected: Option<u32>,
     pub groups_enabled: HashSet<SatGroup>,
-    pub star_field: crate::ui::stars::StarField,
+    pub earth: crate::ui::views::globe3d::Earth,
     pub last_refresh: std::time::Instant,
 }
 
@@ -57,7 +57,7 @@ impl App {
             filter: CatalogFilter::default(),
             selected: None,
             groups_enabled: SatGroup::ALL.iter().copied().collect(),
-            star_field: crate::ui::stars::StarField::load(),
+            earth: crate::ui::views::globe3d::Earth::load(),
             last_refresh: std::time::Instant::now(),
         }
     }
@@ -161,7 +161,6 @@ impl App {
             .show(ctx, |ui| {
                 let area = ui.available_rect_before_wrap();
                 let sats = self.catalog.read().clone();
-                let positions = self.prop.all_positions(&sats, chrono::Utc::now());
 
                 for (i, norm_rect) in self.layout.panes().into_iter().enumerate() {
                     let pixels = egui::Rect::from_min_size(
@@ -172,16 +171,11 @@ impl App {
                         egui::Vec2::new(norm_rect.width() * area.width(), norm_rect.height() * area.height()),
                     );
                     let pane = self.panes[i].clone();
-                    let title = match pane.view {
-                        ViewKind::GroundTrack => {
-                            let name = pane
-                                .focus_norad
-                                .and_then(|n| self.sat_by_norad(n))
-                                .map(|s| s.name)
-                                .unwrap_or_else(|| "—".into());
-                            format!("{} — {}", pane.view.label(), name)
-                        }
-                        v => v.label().to_string(),
+                    // Each pane tracks exactly one satellite.
+                    let focus_sat = pane.focus_norad.and_then(|n| self.sat_by_norad(n));
+                    let title = match &focus_sat {
+                        Some(sat) => format!("{} — {}", pane.view.label(), sat.name),
+                        None => format!("{} — (select a satellite)", pane.view.label()),
                     };
                     let content =
                         panes::draw_pane_frame(ctx, pixels, &title, i == self.active_pane);
@@ -196,7 +190,8 @@ impl App {
 
                     let mut child = panes::pane_ui_at(ui, content);
                     match pane.view {
-                        ViewKind::Globe3D => {                            // Interaction: drag to rotate, scroll to zoom.
+                        ViewKind::Globe3D => {
+                            // Interaction: drag to rotate, scroll to zoom.
                             let resp = child.allocate_rect(child.max_rect(), egui::Sense::click_and_drag());
                             if resp.dragged() {
                                 self.panes[i].globe.drag(resp.drag_delta());
@@ -208,42 +203,46 @@ impl App {
                                 }
                             }
 
-                            let focus_sat = pane
-                                .focus_norad
-                                .and_then(|n| self.sat_by_norad(n));
+                            // Only the focused satellite + its orbit ring.
+                            let now = chrono::Utc::now();
                             let focus_orbit = focus_sat.as_ref().map(|sat| {
-                                self.prop.ground_track(sat, chrono::Utc::now(), -95.0, 95.0, 3.0)
+                                self.prop.ground_track(sat, now, -95.0, 95.0, 3.0)
                             }).unwrap_or_default();
+                            let focus_pos = focus_sat.as_ref().and_then(|sat| {
+                                self.prop.subpoint(sat, now)
+                            });
+                            let sun_dir = views::globe3d::sun_direction(now);
+                            let earth_rot = views::globe3d::earth_rotation(now);
                             let painter = child.painter().clone();
                             views::globe3d::show_globe(
                                 &painter,
                                 child.max_rect(),
                                 &self.panes[i].globe,
-                                &self.star_field,
-                                &sats,
-                                &positions,
+                                &self.earth,
+                                sun_dir,
+                                earth_rot,
                                 focus_sat.as_ref(),
                                 &focus_orbit,
-                                &self.groups_enabled,
+                                focus_pos,
                             );
                         }
                         ViewKind::WorldMap => {
                             let painter = child.painter().clone();
-                            views::show_world_map(
-                                &painter,
-                                child.max_rect(),
-                                &sats,
-                                &positions,
-                                &self.groups_enabled,
-                                self.selected,
-                            );
+                            if let Some(sat) = &focus_sat {
+                                let pos = self.prop.subpoint(sat, chrono::Utc::now());
+                                if let Some(p) = &pos {
+                                    views::show_world_map_full(&painter, child.max_rect(), sat, p);
+                                } else {
+                                    views::show_world_map(&painter, child.max_rect(), None);
+                                }
+                            } else {
+                                views::show_world_map(&painter, child.max_rect(), None);
+                            }
                         }
                         ViewKind::GroundTrack => {
-                            if let Some(norad) = pane.focus_norad {
-                                if let Some(sat) = self.sat_by_norad(norad) {
-                                    let painter = child.painter().clone();
-                                    views::show_ground_track(&painter, child.max_rect(), &sat, &self.prop);
-                                }
+                            if let Some(sat) = &focus_sat {
+                                let painter = child.painter().clone();
+                                views::show_ground_track(&painter, child.max_rect(), sat, &self.prop);
                             } else {
                                 child.vertical_centered(|ui| {
                                     ui.add_space(40.0);
@@ -252,10 +251,8 @@ impl App {
                             }
                         }
                         ViewKind::Detail => {
-                            if let Some(norad) = pane.focus_norad {
-                                if let Some(sat) = self.sat_by_norad(norad) {
-                                    views::show_detail(&mut child, &sat, &self.prop);
-                                }
+                            if let Some(sat) = &focus_sat {
+                                views::show_detail(&mut child, sat, &self.prop);
                             } else {
                                 child.vertical_centered(|ui| {
                                     ui.add_space(40.0);
