@@ -196,7 +196,7 @@ impl App {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.heading("🛰 Satellite Monitor");
+                ui.heading("🛰 Hermes Watch");
                 ui.separator();
                 ui.label("Layout:");
                 for l in Layout::ALL {

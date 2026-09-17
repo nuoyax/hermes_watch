@@ -1,5 +1,5 @@
 [package]
-name = "sat_monitor"
+name = "hermes_watch"
 version = "0.1.0"
 edition = "2021"
 
@@ -33,5 +33,5 @@ opt-level = 3
 lto = "thin"
 
 [lib]
-name = "sat_monitor"
+name = "hermes_watch"
 path = "src/lib.rs"

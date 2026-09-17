@@ -17,9 +17,6 @@ fn main() -> Result<()> {
         )
         .init();
 
-    // Local proxy for Celestrak (direct TLS revocation check fails offline).
-    std::env::set_var("SAT_PROXY", "http://127.0.0.1:7890");
-
     // Async runtime for fetching (runs on its own threads, not the UI thread).
     let runtime = Arc::new(tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -34,13 +31,13 @@ fn main() -> Result<()> {
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Satellite Monitor")
+            .with_title("Hermes Watch — Satellite Monitor")
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Satellite Monitor",
+        "Hermes Watch — Satellite Monitor",
         opts,
         Box::new(move |cc| {
             Ok(Box::new(ui::app::App::new(

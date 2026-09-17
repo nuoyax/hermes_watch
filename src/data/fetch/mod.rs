@@ -39,9 +39,8 @@ pub const SOURCES: &[Source] = &[
     },
 ];
 
-/// HTTP client with browser-like UA. Uses the local proxy (127.0.0.1:7890)
-/// when direct connection fails — Celestrak/GitHub are unreachable directly
-/// from some networks (TLS revocation check fails offline).
+/// HTTP client with browser-like UA. Proxy is optional: read from the
+/// SAT_PROXY env var (configurable in the toolbar settings).
 pub fn http_client() -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) sat-monitor/0.1")
