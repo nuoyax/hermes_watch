@@ -371,10 +371,12 @@ fn blend(c: Color32, alpha: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (255.0 * alpha) as u8)
 }
 
-/// Sun direction in EARTH-FIXED frame (unit vector) at `time`: points from
-/// Earth's center toward the subsolar point. The renderer applies the same
-/// +GMST rotation to both the mesh normals and this vector, so it must be
-/// expressed in the plain Earth-fixed frame (NO GMST subtraction).
+/// Sun direction in the WORLD (inertial) frame (unit vector) at `time`:
+/// points from Earth's center toward the subsolar point. The Earth mesh
+/// bakes +GMST into its vertex longitudes (Earth-fixed texture in a world
+/// frame), so the sun must live in that same world frame — subsolar
+/// longitude PLUS GMST — otherwise the lit hemisphere would rotate with
+/// the Earth and the terminator would never move across the surface.
 pub fn sun_direction(time: DateTime<Utc>) -> V3 {
     // Subsolar point: latitude = solar declination, longitude = where local
     // solar noon is right now (UTC hour angle).
@@ -383,7 +385,7 @@ pub fn sun_direction(time: DateTime<Utc>) -> V3 {
     let utc_hours =
         time.hour() as f64 + time.minute() as f64 / 60.0 + time.second() as f64 / 3600.0;
     // Subsolar longitude: −15° per hour from local noon (12:00 UTC → 0°).
-    let subsolar_lon = -15.0 * (utc_hours - 12.0);
+    let subsolar_lon = -15.0 * (utc_hours - 12.0) + gmst_deg(time);
 
     let (la, lo) = (decl_deg.to_radians(), subsolar_lon.to_radians());
     V3(la.cos() * lo.cos(), la.sin(), la.cos() * lo.sin())
