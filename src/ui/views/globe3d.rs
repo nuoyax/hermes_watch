@@ -67,6 +67,7 @@ pub fn show_globe(
     painter: &Painter,
     _rect: Rect,
     cam: &GlobeState,
+    stars: &crate::ui::stars::StarField,
     sats: &[Sat],
     positions: &[Option<GeoPoint>],
     focus: Option<&Sat>,
@@ -75,6 +76,9 @@ pub fn show_globe(
 ) {
     let center = _rect.center();
     let r = cam.zoom;
+
+    // Real star field (HYG catalog), rotating with the camera, behind everything.
+    stars.paint(painter, center, (r * 2.2).max(120.0), cam.yaw, cam.pitch);
 
     // Ocean disc + atmosphere limb.
     painter.circle_filled(center, r + 4.0, Color32::from_rgba_unmultiplied(90, 140, 220, 60));
@@ -103,7 +107,7 @@ pub fn show_globe(
         }
     }
 
-    // Focus orbit ring (draw under satellite dots).
+    // Focus orbit ring — brighter, drawn under satellite dots, with glow.
     if let Some(sat) = focus {
         let color = sat.group.color();
         let mut prev: Option<(Pos2, f64)> = None;
@@ -111,14 +115,17 @@ pub fn show_globe(
             let alt_r = (r as f64) + p.alt_km * ((r as f64) / 6371.0) * 0.35;
             let cur = project(to_camera(p.lat_deg, p.lon_deg, alt_r, cam), center);
             if let Some((a, az)) = prev {
-                seg(painter, a, az, cur.0, cur.1, blend(color, 0.85), 2.0);
+                // Soft glow underneath + crisp bright line on top.
+                seg(painter, a, az, cur.0, cur.1, blend(color, 0.25), 4.5);
+                seg(painter, a, az, cur.0, cur.1, blend(color, 0.95), 1.8);
             }
             prev = Some(cur);
         }
     }
 
-    // Satellites, back-to-front.
-    let mut pts: Vec<(f64, Pos2, Color32)> = Vec::new();
+    // Unfocused satellites: all orbit tracks stay faint (drawn only when focused
+    // via `focus_orbit`); here just the position dots, back-to-front.
+    let mut pts: Vec<(f64, Pos2, Color32, bool)> = Vec::new();
     for (sat, pos) in sats.iter().zip(positions.iter()) {
         if !groups_enabled.contains(&sat.group) {
             continue;
@@ -126,29 +133,24 @@ pub fn show_globe(
         if let Some(p) = pos {
             let alt_r = (r as f64) + p.alt_km * ((r as f64) / 6371.0) * 0.35;
             let (sp, z) = project(to_camera(p.lat_deg, p.lon_deg, alt_r, cam), center);
-            pts.push((z, sp, sat.group.color()));
+            let is_focus = focus.is_some_and(|f| f.norad_id == sat.norad_id);
+            pts.push((z, sp, sat.group.color(), is_focus));
         }
     }
     pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (z, sp, color) in pts {
-        // Hidden behind the globe only if the point projects inside the disc and z < 0.
+    for (z, sp, color, is_focus) in pts {
         let behind = z < 0.0 && sp.distance(center) < r;
-        if !behind {
-            let c = if z > 0.0 { color } else { blend(color, 0.4) };
-            painter.circle_filled(sp, 2.5, c);
+        if behind {
+            continue;
         }
-    }
-
-    // Highlight the focused satellite's live position.
-    if let Some(sat) = focus {
-        if let Some(p) = positions.iter().flatten().last().copied() {
-            let alt_r = (r as f64) + p.alt_km * ((r as f64) / 6371.0) * 0.35;
-            let (sp, z) = project(to_camera(p.lat_deg, p.lon_deg, alt_r, cam), center);
-            let behind = z < 0.0 && sp.distance(center) < r;
-            if !behind {
-                painter.circle_filled(sp, 5.0, sat.group.color());
-                painter.circle_stroke(sp, 9.0, Stroke::new(1.5, Color32::WHITE));
-            }
+        if is_focus {
+            // Focused satellite: glowing halo + white outline to stand out.
+            painter.circle_filled(sp, 7.0, blend(color, 0.30));
+            painter.circle_filled(sp, 4.0, color);
+            painter.circle_stroke(sp, 5.5, Stroke::new(1.5, Color32::WHITE));
+        } else {
+            let c = if z > 0.0 { blend(color, 0.85) } else { blend(color, 0.35) };
+            painter.circle_filled(sp, 2.5, c);
         }
     }
 }

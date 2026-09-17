@@ -26,6 +26,7 @@ pub struct App {
     pub filter: CatalogFilter,
     pub selected: Option<u32>,
     pub groups_enabled: HashSet<SatGroup>,
+    pub star_field: crate::ui::stars::StarField,
     pub last_refresh: std::time::Instant,
 }
 
@@ -56,6 +57,7 @@ impl App {
             filter: CatalogFilter::default(),
             selected: None,
             groups_enabled: SatGroup::ALL.iter().copied().collect(),
+            star_field: crate::ui::stars::StarField::load(),
             last_refresh: std::time::Instant::now(),
         }
     }
@@ -217,6 +219,7 @@ impl App {
                                 &painter,
                                 child.max_rect(),
                                 &self.panes[i].globe,
+                                &self.star_field,
                                 &sats,
                                 &positions,
                                 focus_sat.as_ref(),
