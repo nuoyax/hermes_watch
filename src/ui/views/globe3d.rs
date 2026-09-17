@@ -19,6 +19,9 @@ pub struct GlobeState {
     pub zoom: f32,
     /// Last interaction (pause auto-spin while the user drags).
     pub last_interaction: Option<std::time::Instant>,
+    /// When set, the camera tracks this Earth-fixed longitude: the location
+    /// stays facing the viewer as the Earth turns underneath (real rotation).
+    pub lock_lon: Option<f64>,
 }
 
 impl Default for GlobeState {
@@ -28,6 +31,7 @@ impl Default for GlobeState {
             pitch: 0.35,
             zoom: 150.0,
             last_interaction: None,
+            lock_lon: None,
         }
     }
 }
@@ -37,14 +41,19 @@ impl GlobeState {
         self.yaw += delta.x as f64 * 0.01;
         self.pitch = (self.pitch + delta.y as f64 * 0.01).clamp(-1.5, 1.5);
         self.last_interaction = Some(std::time::Instant::now());
+        self.lock_lon = None; // manual drag releases the follow-lock
     }
     pub fn zoom(&mut self, factor: f32) {
         self.zoom = (self.zoom * factor).clamp(40.0, 500.0);
         self.last_interaction = Some(std::time::Instant::now());
     }
-    /// Camera yaw: user offset + slow auto-spin (one turn ≈ 2 min), paused 3 s
-    /// after interaction.
-    fn effective_yaw(&self, now: std::time::Instant) -> f64 {
+    /// Camera yaw: either locked onto `lock_lon` (region faces the viewer,
+    /// drifting with the real Earth rotation) or slow free auto-spin,
+    /// paused 3 s after interaction.
+    fn effective_yaw(&self, now: std::time::Instant, gmst: f64) -> f64 {
+        if let Some(lon) = self.lock_lon {
+            return -(lon.to_radians() + gmst);
+        }
         let idle = self
             .last_interaction
             .map(|t| now.duration_since(t).as_secs_f64())
@@ -131,7 +140,7 @@ pub fn show_globe(
     let center = rect.center();
     let r = cam.zoom;
     let now = std::time::Instant::now();
-    let yaw = cam.effective_yaw(now);
+    let yaw = cam.effective_yaw(now, earth_rot);
     let pitch = cam.pitch;
 
     // Deep space + atmosphere limb.

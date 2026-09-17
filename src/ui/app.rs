@@ -289,8 +289,8 @@ impl App {
 /// Timezone quick-jump buttons drawn in the pane title bar (left of 3D/2D).
 /// Clicking rotates the globe so that region faces the viewer.
 fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut crate::ui::views::globe3d::GlobeState) -> bool {
-    // Buttons: 北京 (UTC+8, lon 116.4°E) / 华盛顿 (UTC-5, lon 77°W)
-    const ZONES: &[(&str, f64)] = &[("北京", 116.4), ("DC", -77.0)];
+    // ASCII labels (egui's default font has no CJK glyphs — CJK shows as tofu).
+    const ZONES: &[(&str, f64)] = &[("Beijing", 116.4), ("DC", -77.0)];
     let mut jumped = false;
     let y = pane_rect.min.y + 2.0;
     let painter = ctx.layer_painter(egui::LayerId::new(
@@ -299,7 +299,7 @@ fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut cra
     ));
     let mut x = pane_rect.max.x - 62.0 - 4.0;
     for (label, lon) in ZONES.iter().rev() {
-        let w = 30.0;
+        let w = 44.0;
         x -= w + 4.0;
         let rect = egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(w, 14.0));
         let mouse_in = ctx
@@ -318,18 +318,13 @@ fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut cra
             rect.center(),
             egui::Align2::CENTER_CENTER,
             *label,
-            egui::FontId::proportional(9.5),
+            egui::FontId::proportional(9.0),
             egui::Color32::from_rgb(200, 205, 215),
         );
         if clicked {
-            // Face that longitude toward the viewer: camera yaw offset such that
-            // (lon + GMST rotation) ends up pointing at the camera (+z axis).
-            // In to_camera, yaw rotates world → cam; the point faces the viewer
-            // when its camera-space z is max, i.e. yaw = -(lon_rotated).
-            let now = chrono::Utc::now();
-            let gmst = crate::ui::views::globe3d::earth_rotation(now);
-            let lon_rot = lon.to_radians() + gmst;
-            globe.yaw = -lon_rot;
+            // Face that longitude toward the viewer AND keep following it:
+            // set a "locked longitude" the globe tracks while auto-spinning.
+            globe.lock_lon = Some(*lon);
             globe.last_interaction = Some(std::time::Instant::now());
             jumped = true;
         }
