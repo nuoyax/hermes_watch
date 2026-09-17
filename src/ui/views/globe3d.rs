@@ -100,11 +100,12 @@ impl GlobeState {
             return;
         }
         if self.pitch != Self::default().pitch || self.yaw != base_yaw {
-            let k = ((idle - IDLE_RESET) * 3.0).clamp(0.0, 1.0) as f32; // ~1/3 s ease
+            // Small per-frame factor → exponential glide of ~2 s (at 60 fps).
+            let k = 0.03f32;
             self.pitch += (Self::default().pitch - self.pitch) * k as f64;
             self.yaw += (base_yaw - self.yaw) * k as f64;
         }
-        if idle > IDLE_RESET + 1.0 {
+        if idle > IDLE_RESET + 5.0 {
             self.last_drag = None; // settled — stop easing
         }
     }
