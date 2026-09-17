@@ -28,6 +28,10 @@ pub struct App {
     pub groups_enabled: HashSet<SatGroup>,
     pub earth: crate::ui::views::globe3d::Earth,
     pub last_refresh: std::time::Instant,
+    /// Catalog length at the time `catalog_snapshot` was taken (change marker).
+    catalog_version: std::cell::Cell<usize>,
+    /// Sidebar renders from this snapshot instead of cloning 16k sats/frame.
+    catalog_snapshot: std::cell::RefCell<Vec<Sat>>,
 }
 
 impl App {
@@ -59,6 +63,8 @@ impl App {
             groups_enabled: SatGroup::ALL.iter().copied().collect(),
             earth: crate::ui::views::globe3d::Earth::load(),
             last_refresh: std::time::Instant::now(),
+            catalog_version: std::cell::Cell::new(0),
+            catalog_snapshot: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -222,7 +228,15 @@ impl App {
         egui::SidePanel::left("sidebar")
             .default_width(280.0)
             .show(ctx, |ui| {
-                let sats = self.catalog.read().clone();
+                // Render from a snapshot taken only when the catalog changed,
+                // not a 16k-element clone on every frame (startup freeze).
+                let version = self.catalog_version.get();
+                let current = self.catalog.read().len();
+                if version != current {
+                    self.catalog_version.set(current);
+                    *self.catalog_snapshot.borrow_mut() = self.catalog.read().clone();
+                }
+                let sats = self.catalog_snapshot.borrow();
                 if let Some(norad) = show_catalog(ui, &sats, &mut self.filter) {
                     self.selected = Some(norad);
                     // Focus the active pane.

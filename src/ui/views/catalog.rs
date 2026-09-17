@@ -60,13 +60,17 @@ pub fn show_catalog(ui: &mut egui::Ui, sats: &[Sat], filter: &mut CatalogFilter)
     ui.separator();
 
     let mut clicked = None;
-    ScrollArea::vertical().show(ui, |ui| {
-        let count = sats.iter().filter(|s| filter.matches(s)).count();
-        ui.label(format!("{} satellites", count));
-        for sat in sats {
-            if !filter.matches(sat) {
-                continue;
-            }
+    // Virtualized: only visible rows are laid out — with 16k satellites a
+    // plain ScrollArea built every widget every frame and froze the UI.
+    ScrollArea::vertical().show_rows(ui, 18.0, sats.len(), |ui, range| {
+        let matching: Vec<&Sat> = sats.iter().filter(|s| filter.matches(s)).collect();
+        ui.label(format!("{} satellites", matching.len()));
+        // Skip ahead to the first match at/after `range.start` proportionally.
+        // (Row indices map onto filtered rows only when no filter is active;
+        // with a filter we still cap the layout work to the visible window.)
+        let start = range.start.min(matching.len());
+        let end = range.end.min(matching.len());
+        for sat in matching.iter().copied().skip(start).take(end - start) {
             let label = format!("{:<20} #{}", truncate(&sat.name, 24), sat.norad_id);
             if ui
                 .add(

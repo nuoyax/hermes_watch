@@ -237,8 +237,8 @@ pub fn show_globe(
     let Some(sat) = sat else { return };
     let color = sat.group.color();
 
-    // Orbit ring — solid white line, dimmer where behind the globe.
-    let mut prev: Option<(Pos2, f64)> = None;
+    // Orbit ring — thin white line, hidden where it passes behind the globe.
+    let mut prev: Option<(Pos2, bool)> = None;
     for p in orbit {
         let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.45);
         let (la_r, lo_r) = (
@@ -248,12 +248,16 @@ pub fn show_globe(
         let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
         let cam_v = rotate_to_cam(n, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
+        // Occlusion: a point is hidden when it's on the far side (z < 0) AND
+        // its projection lands inside the globe disc.
+        let visible = cur.1 > 0.0 || cur.0.distance(center) > r;
         if let Some((a, az)) = prev {
-            let fade = if az > 0.0 && cur.1 > 0.0 { 1.0 } else { 0.45 };
-            let white = Color32::WHITE;
-            painter.line_segment([a, cur.0], Stroke::new(2.5, blend(white, fade)));
+            if az && visible {
+                painter.line_segment([a, cur.0], Stroke::new(2.5, blend(Color32::WHITE, 0.10)));
+                painter.line_segment([a, cur.0], Stroke::new(0.6, blend(Color32::WHITE, 0.80)));
+            }
         }
-        prev = Some(cur);
+        prev = Some((cur.0, visible));
     }
 
     // The satellite: simple 3D model (body + two solar panels) oriented
@@ -295,46 +299,43 @@ fn draw_satellite_model(painter: &Painter, sp: Pos2, center: Pos2, color: Color3
     };
 
     // Soft glow so the icon reads on both bright and dark ground.
-    painter.circle_filled(sp, 13.0, blend(color, 0.22));
+    painter.circle_filled(sp, 12.0, blend(color, 0.25));
 
-    // Truss connecting the two panels through the body.
-    painter.line_segment(
-        [sp + rot(Vec2::new(-16.0, 0.0)), sp + rot(Vec2::new(16.0, 0.0))],
-        Stroke::new(1.5, Color32::from_rgb(170, 175, 185)),
-    );
-
-    // Solar panels: dark blue with a lighter grid frame.
+    // Solar panels: dark blue rectangles with cell lines, one on each side.
     let panel = |side: f32| {
-        let off = side * 11.5;
-        let c = sp + rot(Vec2::new(off, 0.0));
-        let (hw, hh) = (5.5, 3.5);
+        let c = sp + rot(Vec2::new(side * 10.0, 0.0));
+        let (hw, hh) = (6.0, 3.5);
         let (u, v) = (rot(Vec2::new(hw, 0.0)), rot(Vec2::new(0.0, hh)));
         let corners = [c + u + v, c - u + v, c - u - v, c + u - v];
         painter.add(egui::Shape::convex_polygon(
             corners.to_vec(),
-            Color32::from_rgb(35, 60, 150),
-            Stroke::new(1.0, Color32::from_rgb(110, 140, 220)),
+            Color32::from_rgb(40, 70, 170),
+            Stroke::new(1.0, Color32::from_rgb(120, 150, 230)),
         ));
-        // Panel cell line.
-        painter.line_segment(
-            [c + rot(Vec2::new(0.0, -hh)), c + rot(Vec2::new(0.0, hh))],
-            Stroke::new(0.8, Color32::from_rgb(90, 120, 200)),
-        );
+        // Two cell-divider lines across the panel.
+        for f in [-0.33f32, 0.33] {
+            painter.line_segment(
+                [c + rot(Vec2::new(hw * f, -hh)), c + rot(Vec2::new(hw * f, hh))],
+                Stroke::new(0.7, Color32::from_rgb(90, 120, 200)),
+            );
+        }
     };
     panel(-1.0);
     panel(1.0);
 
-    // Body: light metal box with a shaded top edge.
-    let (bw, bh) = (4.5, 4.0);
+    // Body: light metal box.
+    let (bw, bh) = (4.0, 4.5);
     let (u, v) = (rot(Vec2::new(bw, 0.0)), rot(Vec2::new(0.0, bh)));
     let corners = [sp + u + v, sp - u + v, sp - u - v, sp + u - v];
     painter.add(egui::Shape::convex_polygon(
         corners.to_vec(),
-        Color32::from_rgb(215, 220, 230),
-        Stroke::new(1.0, Color32::from_rgb(120, 125, 140)),
+        Color32::from_rgb(225, 228, 235),
+        Stroke::new(1.0, Color32::from_rgb(110, 115, 130)),
     ));
-    // Antenna dot.
-    painter.circle_filled(sp + rot(Vec2::new(0.0, -6.5)), 1.4, Color32::WHITE);
+    // Dish antenna pointing at Earth.
+    let tip = sp + rot(Vec2::new(0.0, 8.0));
+    painter.line_segment([sp, tip], Stroke::new(1.0, Color32::from_rgb(200, 205, 215)));
+    painter.circle_filled(tip, 1.6, Color32::WHITE);
 }
 
 fn blend(c: Color32, alpha: f32) -> Color32 {
