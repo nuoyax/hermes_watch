@@ -69,7 +69,7 @@ impl Propagator {
             return Vec::new();
         };
         let mut pts = Vec::new();
-        let mut m = center - past_min;
+        let mut m = center + past_min;
         while m <= center + future_min {
             if let Ok(pred) = consts.propagate(MinutesSinceEpoch(m)) {
                 pts.push(to_geodetic(pred, time));

@@ -237,10 +237,10 @@ pub fn show_globe(
     let Some(sat) = sat else { return };
     let color = sat.group.color();
 
-    // Orbit ring — glow + line, fading where behind the globe.
+    // Orbit ring — solid white line, dimmer where behind the globe.
     let mut prev: Option<(Pos2, f64)> = None;
     for p in orbit {
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.35);
+        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.45);
         let (la_r, lo_r) = (
             p.lat_deg.to_radians(),
             (p.lon_deg + earth_rot.to_degrees()).to_radians(),
@@ -256,23 +256,22 @@ pub fn show_globe(
         prev = Some(cur);
     }
 
-    // The satellite: glowing halo + white-outlined dot + label.
+    // The satellite: simple 3D model (body + two solar panels) oriented
+    // toward Earth, like the classic satellite pictogram, plus label.
     if let Some(p) = sat_pos {
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.35);
+        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.45);
         let (la_r, lo_r) = (
             p.lat_deg.to_radians(),
-            (p.lat_deg * 0.0 + p.lon_deg + earth_rot.to_degrees()).to_radians(),
+            (p.lon_deg + earth_rot.to_degrees()).to_radians(),
         );
         let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
         let cam_v = rotate_to_cam(n, alt_r, yaw, pitch);
         let (sp, z) = project(cam_v, center);
         let behind = z < 0.0 && sp.distance(center) < r;
         if !behind {
-            painter.circle_filled(sp, 9.0, blend(color, 0.30));
-            painter.circle_filled(sp, 4.5, color);
-            painter.circle_stroke(sp, 6.0, Stroke::new(1.5, Color32::WHITE));
+            draw_satellite_model(&painter, sp, center, color);
             painter.text(
-                sp + Vec2::new(12.0, -10.0),
+                sp + Vec2::new(14.0, -12.0),
                 egui::Align2::LEFT_BOTTOM,
                 format!("{} · {} km", sat.name, p.alt_km as i32),
                 egui::FontId::proportional(11.0),
@@ -280,6 +279,62 @@ pub fn show_globe(
             );
         }
     }
+}
+
+/// Draw a small satellite pictogram at `sp`: central body box + two solar
+/// panel wings + a thin truss, tilted to point at the Earth's center (like
+/// the standard satellite icon). Glow underneath keeps it readable.
+fn draw_satellite_model(painter: &Painter, sp: Pos2, center: Pos2, color: Color32) {
+    // Orientation: the satellite's panels face perpendicular to the line to
+    // Earth; rotate the icon so "down" points at the globe center.
+    let to_earth = (center - sp).normalized();
+    let ang = to_earth.y.atan2(to_earth.x) - std::f32::consts::FRAC_PI_2;
+    let rot = |v: Vec2| -> Vec2 {
+        let (s, c) = ang.sin_cos();
+        Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+    };
+
+    // Soft glow so the icon reads on both bright and dark ground.
+    painter.circle_filled(sp, 13.0, blend(color, 0.22));
+
+    // Truss connecting the two panels through the body.
+    painter.line_segment(
+        [sp + rot(Vec2::new(-16.0, 0.0)), sp + rot(Vec2::new(16.0, 0.0))],
+        Stroke::new(1.5, Color32::from_rgb(170, 175, 185)),
+    );
+
+    // Solar panels: dark blue with a lighter grid frame.
+    let panel = |side: f32| {
+        let off = side * 11.5;
+        let c = sp + rot(Vec2::new(off, 0.0));
+        let (hw, hh) = (5.5, 3.5);
+        let (u, v) = (rot(Vec2::new(hw, 0.0)), rot(Vec2::new(0.0, hh)));
+        let corners = [c + u + v, c - u + v, c - u - v, c + u - v];
+        painter.add(egui::Shape::convex_polygon(
+            corners.to_vec(),
+            Color32::from_rgb(35, 60, 150),
+            Stroke::new(1.0, Color32::from_rgb(110, 140, 220)),
+        ));
+        // Panel cell line.
+        painter.line_segment(
+            [c + rot(Vec2::new(0.0, -hh)), c + rot(Vec2::new(0.0, hh))],
+            Stroke::new(0.8, Color32::from_rgb(90, 120, 200)),
+        );
+    };
+    panel(-1.0);
+    panel(1.0);
+
+    // Body: light metal box with a shaded top edge.
+    let (bw, bh) = (4.5, 4.0);
+    let (u, v) = (rot(Vec2::new(bw, 0.0)), rot(Vec2::new(0.0, bh)));
+    let corners = [sp + u + v, sp - u + v, sp - u - v, sp + u - v];
+    painter.add(egui::Shape::convex_polygon(
+        corners.to_vec(),
+        Color32::from_rgb(215, 220, 230),
+        Stroke::new(1.0, Color32::from_rgb(120, 125, 140)),
+    ));
+    // Antenna dot.
+    painter.circle_filled(sp + rot(Vec2::new(0.0, -6.5)), 1.4, Color32::WHITE);
 }
 
 fn blend(c: Color32, alpha: f32) -> Color32 {

@@ -31,3 +31,7 @@ egui = "0.29"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[lib]
+name = "sat_monitor"
+path = "src/lib.rs"
