@@ -58,12 +58,11 @@ impl GlobeState {
             .last_interaction
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(f64::INFINITY);
-        let spin = if idle > 3.0 {
-            now.elapsed().as_secs_f64() * 0.05
-        } else {
-            0.0
-        };
-        self.yaw + spin
+        if idle < 3.0 {
+            // Hold still right after a drag — no drift.
+            return self.yaw;
+        }
+        self.yaw
     }
 }
 
@@ -260,14 +259,25 @@ fn blend(c: Color32, alpha: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (255.0 * alpha) as u8)
 }
 
-/// Sun direction in Earth-fixed frame (unit vector) at `time`.
+/// Sun direction in EARTH-FIXED frame (unit vector) at `time`: points from
+/// Earth's center toward the subsolar point, expressed in the same frame the
+/// texture/longitudes use. Because the mesh rotates longitudes by GMST, the
+/// sun must be counter-rotated by the same amount to stay physically correct.
 pub fn sun_direction(time: DateTime<Utc>) -> V3 {
+    // Subsolar point: latitude = solar declination, longitude = where local
+    // solar noon is right now (UTC hour angle).
     let day = time.ordinal() as f64;
     let decl_deg = -23.44 * ((2.0 * std::f64::consts::PI * (day - 81.0) / 365.25).sin());
     let utc_hours =
         time.hour() as f64 + time.minute() as f64 / 60.0 + time.second() as f64 / 3600.0;
-    let lon_deg = (180.0 - utc_hours * 15.0).rem_euclid(360.0) - 180.0;
-    let (la, lo) = (decl_deg.to_radians(), lon_deg.to_radians());
+    let subsolar_lon = (180.0 - utc_hours * 15.0).rem_euclid(360.0) - 180.0;
+
+    // The mesh places Earth-fixed lon L at world angle (L + GMST). To express
+    // the sun in the mesh's Earth-fixed frame, subtract GMST.
+    let gmst_deg_now = gmst_deg(time);
+    let lon_ef = subsolar_lon - gmst_deg_now;
+
+    let (la, lo) = (decl_deg.to_radians(), lon_ef.to_radians());
     V3(la.cos() * lo.cos(), la.sin(), la.cos() * lo.sin())
 }
 
