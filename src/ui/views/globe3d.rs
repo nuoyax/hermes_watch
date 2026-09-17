@@ -270,9 +270,9 @@ pub fn show_globe(
     for p in orbit_eci {
         let v = eci_to_n(p);
         let alt = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - 6371.0;
-        // Altitude exaggerated so LEO orbits clear the surface visually;
-        // the displayed km values stay true.
-        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.90);
+        // Moderate exaggeration: the ring stays fully inside the pane while
+        // LEO orbits still clear the surface (displayed km values stay true).
+        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.30);
         let cam_v = rotate_to_cam(v, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         // Occlusion: a point is hidden when it's on the far side (z < 0) AND
@@ -292,7 +292,7 @@ pub fn show_globe(
     if let Some(p) = sat_pos {
         // Same exaggerated altitude scaling as the orbit ring — so the
         // marker rides exactly on the ring (displayed km values stay true).
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.90);
+        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.30);
         let (la_r, lo_r) = (
             p.lat_deg.to_radians(),
             (p.lon_deg + earth_rot.to_degrees()).to_radians(),
