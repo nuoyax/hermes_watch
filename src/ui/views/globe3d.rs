@@ -252,30 +252,27 @@ pub fn show_globe(
 
     // Orbit ring — the TRUE inertial ellipse (smooth, from ECI positions),
     // drawn as a thin white line hidden where it passes behind the globe.
-    // ECI → view: rotate the whole frame by -GMST so the Earth mesh (which is
-    // drawn at +GMST) aligns with it; the ellipse keeps its real shape.
-    let gmst = earth_rot;
+    // ECI axes map straight into the renderer's world frame (the Earth mesh
+    // is drawn at +GMST, so inertial lon == world lon); the ring therefore
+    // stays fixed while the Earth turns underneath, and the satellite marker
+    // — which uses the same mapping — rides exactly on it.
     let eci_to_n = |p: &[f64; 3]| -> V3 {
         let (x, y, z) = (p[0], p[1], p[2]);
         let rr = (x * x + y * y + z * z).sqrt();
         if rr < 1.0 {
             return V3(0.0, 0.0, 0.0);
         }
-        // Rotate ECI by -gmst about the z axis, then normalize.
-        let (cg, sg) = gmst.sin_cos();
-        let xr = x * cg + y * sg;
-        let yr = -x * sg + y * cg;
-        // Renderer convention: n = (cosφ·cosλ', sinφ, cosφ·sinλ') where the
-        // mesh applies +gmst to Earth-fixed lon. ECI (x,y,z) with -gmst gives
-        // (xr, z-height, yr) in that convention: x̂=cosφ·cosλ', ŷ=sinφ (up),
-        // ẑ=cosφ·sinλ'. Map: n = (xr/rr, z/rr, yr/rr).
-        V3(xr / rr, z / rr, yr / rr)
+        // Renderer convention: n = (cosφ·cosλ, sinφ, cosφ·sinλ) with λ the
+        // world (inertial) longitude = atan2(y, x). Map: n = (x/rr, z/rr, y/rr).
+        V3(x / rr, z / rr, y / rr)
     };
     let mut prev: Option<(Pos2, bool)> = None;
     for p in orbit_eci {
         let v = eci_to_n(p);
         let alt = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - 6371.0;
-        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.45);
+        // Altitude exaggerated so LEO orbits clear the surface visually;
+        // the displayed km values stay true.
+        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.90);
         let cam_v = rotate_to_cam(v, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         // Occlusion: a point is hidden when it's on the far side (z < 0) AND
@@ -293,7 +290,9 @@ pub fn show_globe(
     // The satellite: simple 3D model (body + two solar panels) oriented
     // toward Earth, like the classic satellite pictogram, plus label.
     if let Some(p) = sat_pos {
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.45);
+        // Same exaggerated altitude scaling as the orbit ring — so the
+        // marker rides exactly on the ring (displayed km values stay true).
+        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.90);
         let (la_r, lo_r) = (
             p.lat_deg.to_radians(),
             (p.lon_deg + earth_rot.to_degrees()).to_radians(),
