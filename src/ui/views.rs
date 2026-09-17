@@ -3,6 +3,8 @@
 pub mod catalog;
 pub mod detail;
 pub mod globe3d;
+#[cfg(test)]
+mod globe3d_tests;
 pub mod ground_track;
 pub mod world_map;
 

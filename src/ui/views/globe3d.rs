@@ -48,11 +48,20 @@ impl GlobeState {
         self.last_interaction = Some(std::time::Instant::now());
     }
     /// Camera yaw: either locked onto `lock_lon` (region faces the viewer,
-    /// drifting with the real Earth rotation) or slow free auto-spin,
-    /// paused 3 s after interaction.
+    /// drifting with the real Earth rotation) or free (user yaw), paused 3 s
+    /// after interaction.
+    #[cfg(test)]
+    pub(crate) fn effective_yaw_for_test(&self, now: std::time::Instant, gmst: f64) -> f64 {
+        self.effective_yaw(now, gmst)
+    }
     fn effective_yaw(&self, now: std::time::Instant, gmst: f64) -> f64 {
         if let Some(lon) = self.lock_lon {
-            return -(lon.to_radians() + gmst);
+            // Mesh places Earth-fixed lon L at world longitude (L + gmst).
+            // rotate_to_cam maps world lon W to camera angle (W - yaw); the
+            // camera sits on +z, which is world lon +90°. So the point faces
+            // the viewer when (L + gmst) - yaw = 90°  ⇒  yaw = L + gmst - 90°.
+            let lon_rot = lon.to_radians() + gmst;
+            return lon_rot - std::f64::consts::FRAC_PI_2;
         }
         let idle = self
             .last_interaction
@@ -111,6 +120,8 @@ impl V3 {
 }
 
 /// Camera transform: world unit vector → camera space (scaled by r).
+/// Convention: camera looks down +z (a point faces the viewer when its
+/// camera-space z equals +r). Yaw spins around the polar axis; pitch tilts.
 fn rotate_to_cam(v: V3, r: f64, yaw: f64, pitch: f64) -> V3 {
     let (cp, sp) = (pitch.cos(), pitch.sin());
     let y2 = v.1 * cp - v.2 * sp;
@@ -121,6 +132,12 @@ fn rotate_to_cam(v: V3, r: f64, yaw: f64, pitch: f64) -> V3 {
 
 fn project(v: V3, center: Pos2) -> (Pos2, f64) {
     (Pos2::new(center.x + v.0 as f32, center.y - v.1 as f32), v.2)
+}
+
+/// Test hook: camera transform exposed for geometry unit tests.
+#[cfg(test)]
+pub fn rotate_to_cam_test_hook(v: V3, r: f64, yaw: f64, pitch: f64) -> V3 {
+    rotate_to_cam(v, r, yaw, pitch)
 }
 
 /// Render the textured rotating Earth + focused satellite.
@@ -260,9 +277,9 @@ fn blend(c: Color32, alpha: f32) -> Color32 {
 }
 
 /// Sun direction in EARTH-FIXED frame (unit vector) at `time`: points from
-/// Earth's center toward the subsolar point, expressed in the same frame the
-/// texture/longitudes use. Because the mesh rotates longitudes by GMST, the
-/// sun must be counter-rotated by the same amount to stay physically correct.
+/// Earth's center toward the subsolar point. The renderer applies the same
+/// +GMST rotation to both the mesh normals and this vector, so it must be
+/// expressed in the plain Earth-fixed frame (NO GMST subtraction).
 pub fn sun_direction(time: DateTime<Utc>) -> V3 {
     // Subsolar point: latitude = solar declination, longitude = where local
     // solar noon is right now (UTC hour angle).
@@ -270,14 +287,10 @@ pub fn sun_direction(time: DateTime<Utc>) -> V3 {
     let decl_deg = -23.44 * ((2.0 * std::f64::consts::PI * (day - 81.0) / 365.25).sin());
     let utc_hours =
         time.hour() as f64 + time.minute() as f64 / 60.0 + time.second() as f64 / 3600.0;
-    let subsolar_lon = (180.0 - utc_hours * 15.0).rem_euclid(360.0) - 180.0;
+    // Subsolar longitude: −15° per hour from local noon (12:00 UTC → 0°).
+    let subsolar_lon = -15.0 * (utc_hours - 12.0);
 
-    // The mesh places Earth-fixed lon L at world angle (L + GMST). To express
-    // the sun in the mesh's Earth-fixed frame, subtract GMST.
-    let gmst_deg_now = gmst_deg(time);
-    let lon_ef = subsolar_lon - gmst_deg_now;
-
-    let (la, lo) = (decl_deg.to_radians(), lon_ef.to_radians());
+    let (la, lo) = (decl_deg.to_radians(), subsolar_lon.to_radians());
     V3(la.cos() * lo.cos(), la.sin(), la.cos() * lo.sin())
 }
 
