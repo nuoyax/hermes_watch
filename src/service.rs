@@ -1,6 +1,6 @@
 //! Background fetch service: pulls TLE catalogs from all sources on a timer.
 
-use crate::data::fetch::{self, SOURCES};
+use crate::data::fetch::{self, FetchConfig, SOURCES};
 use crate::data::model::{Sat, SatGroup};
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ pub fn spawn(
     runtime: &tokio::runtime::Runtime,
     status: Arc<RwLock<FetchStatus>>,
     catalog: Arc<RwLock<Vec<Sat>>>,
+    config: Arc<RwLock<FetchConfig>>,
 ) -> mpsc::UnboundedReceiver<FetchMsg> {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = runtime.handle().clone();
@@ -50,6 +51,7 @@ pub fn spawn(
         let tx = tx.clone();
         let status = Arc::clone(&status);
         let catalog = Arc::clone(&catalog);
+        let config = Arc::clone(&config);
         let group = groups
             .iter()
             .find(|(n, _)| *n == src.name)
@@ -57,7 +59,8 @@ pub fn spawn(
             .unwrap_or(SatGroup::Other);
 
         handle.spawn(async move {
-            let result = fetch::celestrak::fetch_source(src, group)
+            let cfg = config.read().clone();
+            let result = fetch::celestrak::fetch_source(src, group, &cfg)
                 .await
                 .map_err(|e| format!("{}: {e:#}", src.name));
 

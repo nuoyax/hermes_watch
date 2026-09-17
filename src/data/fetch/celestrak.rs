@@ -1,12 +1,16 @@
 //! Celestrak TLE catalog fetcher & TLE text parser.
 
-use crate::data::fetch::{http_client, Source};
+use crate::data::fetch::{http_client_with, FetchConfig, Source};
 use crate::data::model::{Sat, SatGroup, Tle};
 use anyhow::{Context, Result};
 
 /// Fetch a source and parse its 3-line TLE text (name / line1 / line2 per sat).
-pub async fn fetch_source(source: &Source, group: SatGroup) -> Result<Vec<Sat>> {
-    let text = http_client()?
+pub async fn fetch_source(
+    source: &Source,
+    group: SatGroup,
+    config: &FetchConfig,
+) -> Result<Vec<Sat>> {
+    let text = http_client_with(config)?
         .get(source.url)
         .send()
         .await

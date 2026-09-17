@@ -25,9 +25,17 @@ fn main() -> Result<()> {
 
     let catalog = Arc::new(RwLock::new(Vec::<data::model::Sat>::new()));
     let status = Arc::new(RwLock::new(service::FetchStatus::default()));
+    let fetch_config = Arc::new(RwLock::new(data::fetch::FetchConfig {
+        proxy: std::env::var("SAT_PROXY").ok().filter(|s| !s.is_empty()),
+    }));
 
     // Kick off initial fetch.
-    let fetch_rx = service::spawn(&runtime, Arc::clone(&status), Arc::clone(&catalog));
+    let fetch_rx = service::spawn(
+        &runtime,
+        Arc::clone(&status),
+        Arc::clone(&catalog),
+        Arc::clone(&fetch_config),
+    );
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -46,6 +54,7 @@ fn main() -> Result<()> {
                 status,
                 fetch_rx,
                 runtime,
+                fetch_config,
             )))
         }),
     )

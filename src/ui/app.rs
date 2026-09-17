@@ -18,6 +18,11 @@ pub struct App {
     pub status: Arc<RwLock<FetchStatus>>,
     pub fetch_rx: tokio::sync::mpsc::UnboundedReceiver<FetchMsg>,
     pub runtime: Arc<tokio::runtime::Runtime>,
+    /// Shared connection settings (toolbar-configurable).
+    pub fetch_config: Arc<RwLock<crate::data::fetch::FetchConfig>>,
+    /// Toolbar settings dialog state (proxy URL being edited).
+    settings_open: bool,
+    settings_proxy_draft: String,
 
     pub prop: Propagator,
     pub layout: Layout,
@@ -41,6 +46,7 @@ impl App {
         status: Arc<RwLock<FetchStatus>>,
         fetch_rx: tokio::sync::mpsc::UnboundedReceiver<FetchMsg>,
         runtime: Arc<tokio::runtime::Runtime>,
+        fetch_config: Arc<RwLock<crate::data::fetch::FetchConfig>>,
     ) -> Self {
         // Dark theme.
         let mut visuals = egui::Visuals::dark();
@@ -54,6 +60,9 @@ impl App {
             status,
             fetch_rx,
             runtime,
+            fetch_config,
+            settings_open: false,
+            settings_proxy_draft: String::new(),
             prop: Propagator::new(),
             layout: Layout::Four,
             panes: (0..4).map(|_| Pane::default()).collect(),
@@ -123,9 +132,10 @@ impl eframe::App for App {
             let status = Arc::clone(&self.status);
             let catalog = Arc::clone(&self.catalog);
             let rt = Arc::clone(&self.runtime);
+            let cfg = Arc::clone(&self.fetch_config);
             std::thread::spawn(move || {
                 // Simple re-fetch: reuse service::spawn on a fresh channel.
-                let rx = crate::service::spawn(&rt, status, catalog);
+                let rx = crate::service::spawn(&rt, status, catalog, cfg);
                 std::mem::forget(rx);
             });
         }
@@ -133,6 +143,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
 
         self.top_bar(ctx);
+        self.settings_dialog(ctx);
         self.sidebar(ctx);
         self.content(ctx);
         let dt = frame_start.elapsed();
@@ -198,6 +209,12 @@ impl App {
             ui.horizontal(|ui| {
                 ui.heading("🛰 Hermes Watch");
                 ui.separator();
+                if ui.button("⚙ Settings").clicked() {
+                    self.settings_proxy_draft =
+                        self.fetch_config.read().proxy.clone().unwrap_or_default();
+                    self.settings_open = true;
+                }
+                ui.separator();
                 ui.label("Layout:");
                 for l in Layout::ALL {
                     if ui.selectable_label(self.layout == l, l.label()).clicked() {
@@ -230,6 +247,53 @@ impl App {
                 }
             });
             ui.add_space(2.0);
+        });
+    }
+
+    /// Connection settings dialog: proxy URL, saved on "Apply & Refresh".
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = self.settings_open;
+        egui::Window::new("⚙ Settings")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("HTTP proxy (optional)");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.settings_proxy_draft)
+                        .hint_text("e.g. http://127.0.0.1:7890 — empty = direct")
+                        .desired_width(320.0),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("✔ Apply && Refresh").clicked() {
+                        let p = self.settings_proxy_draft.trim().to_string();
+                        self.fetch_config.write().proxy =
+                            if p.is_empty() { None } else { Some(p) };
+                        self.refresh(ctx);
+                        self.settings_open = false;
+                    }
+                    if ui.button("✕ Cancel").clicked() {
+                        self.settings_open = false;
+                    }
+                });
+            });
+        self.settings_open = open;
+    }
+
+    /// Re-fetch all sources with the current fetch config.
+    fn refresh(&mut self, _ctx: &egui::Context) {
+        tracing::info!("refresh catalog (settings applied)");
+        let status = Arc::clone(&self.status);
+        let catalog = Arc::clone(&self.catalog);
+        let cfg = Arc::clone(&self.fetch_config);
+        let rt = Arc::clone(&self.runtime);
+        std::thread::spawn(move || {
+            let rx = crate::service::spawn(&rt, status, catalog, cfg);
+            std::mem::forget(rx);
         });
     }
 

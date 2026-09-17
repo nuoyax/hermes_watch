@@ -55,3 +55,32 @@ pub fn http_client() -> Result<reqwest::Client> {
     }
     Ok(builder.build()?)
 }
+
+/// Connection settings, configurable from the toolbar.
+#[derive(Debug, Clone, Default)]
+pub struct FetchConfig {
+    /// Optional HTTP(S) proxy URL, e.g. `http://127.0.0.1:7890`.
+    pub proxy: Option<String>,
+}
+
+/// HTTP client with browser-like UA. Proxy is optional: taken from
+/// `FetchConfig` (toolbar settings) or the `SAT_PROXY` env var as fallback.
+pub fn http_client_with(cfg: &FetchConfig) -> Result<reqwest::Client> {
+    let proxy = cfg
+        .proxy
+        .clone()
+        .or_else(|| std::env::var("SAT_PROXY").ok())
+        .filter(|s| !s.trim().is_empty());
+    let mut builder = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) hermes-watch/0.1")
+        .timeout(Duration::from_secs(30));
+    if let Some(proxy) = proxy {
+        if let Ok(p) = reqwest::Proxy::http(&proxy) {
+            builder = builder.proxy(p);
+        }
+        if let Ok(p) = reqwest::Proxy::https(&proxy) {
+            builder = builder.proxy(p);
+        }
+    }
+    Ok(builder.build()?)
+}
