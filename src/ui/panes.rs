@@ -108,7 +108,7 @@ pub struct Pane {
     pub globe: globe3d::GlobeState,
     /// Cached orbit ring: (norad, computed_at, points). Re-propagated only
     /// when the satellite changes or the cache is > 30 s old.
-    pub orbit_cache: Option<(u32, std::time::Instant, Vec<crate::orbit::GeoPoint>)>,
+    pub orbit_cache: Option<(u32, std::time::Instant, Vec<[f64; 3]>)>,
 }
 
 impl Default for Pane {

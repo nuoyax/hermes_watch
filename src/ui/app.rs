@@ -79,13 +79,17 @@ impl App {
         pane: &mut Pane,
         prop: &mut Propagator,
         sat: &Sat,
-    ) -> Vec<crate::orbit::GeoPoint> {
+    ) -> Vec<[f64; 3]> {
         let fresh = pane
             .orbit_cache
             .as_ref()
             .is_some_and(|(norad, t, _)| *norad == sat.norad_id && t.elapsed().as_secs_f64() < 30.0);
         if !fresh {
-            let track = prop.ground_track(sat, chrono::Utc::now(), -95.0, 95.0, 3.0);
+            // True inertial orbit: one full revolution centred on now,
+            // smooth (94 points over ~95 min for LEO).
+            let period_hint = 95.0; // minutes of half revolution — covers LEO..MEO nicely
+            let track =
+                prop.orbit_eci(sat, chrono::Utc::now(), -period_hint, period_hint, 2.0);
             pane.orbit_cache = Some((sat.norad_id, std::time::Instant::now(), track));
         }
         pane.orbit_cache.as_ref().unwrap().2.clone()
@@ -94,6 +98,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
         // Drain fetch messages.
         let mut first_batch_done = false;
         while let Ok(FetchMsg::SourceDone { source, result }) = self.fetch_rx.try_recv() {
@@ -130,6 +135,10 @@ impl eframe::App for App {
         self.top_bar(ctx);
         self.sidebar(ctx);
         self.content(ctx);
+        let dt = frame_start.elapsed();
+        if dt.as_millis() > 50 {
+            tracing::warn!("slow frame: {} ms", dt.as_millis());
+        }
     }
 }
 

@@ -157,7 +157,7 @@ pub fn show_globe(
     sun_dir_ef: V3,
     earth_rot: f64,
     sat: Option<&Sat>,
-    orbit: &[GeoPoint],
+    orbit_eci: &[[f64; 3]],
     sat_pos: Option<GeoPoint>,
 ) {
     let center = rect.center();
@@ -237,16 +237,33 @@ pub fn show_globe(
     let Some(sat) = sat else { return };
     let color = sat.group.color();
 
-    // Orbit ring — thin white line, hidden where it passes behind the globe.
+    // Orbit ring — the TRUE inertial ellipse (smooth, from ECI positions),
+    // drawn as a thin white line hidden where it passes behind the globe.
+    // ECI → view: rotate the whole frame by -GMST so the Earth mesh (which is
+    // drawn at +GMST) aligns with it; the ellipse keeps its real shape.
+    let gmst = earth_rot;
+    let eci_to_n = |p: &[f64; 3]| -> V3 {
+        let (x, y, z) = (p[0], p[1], p[2]);
+        let rr = (x * x + y * y + z * z).sqrt();
+        if rr < 1.0 {
+            return V3(0.0, 0.0, 0.0);
+        }
+        // Rotate ECI by -gmst about the z axis, then normalize.
+        let (cg, sg) = gmst.sin_cos();
+        let xr = x * cg + y * sg;
+        let yr = -x * sg + y * cg;
+        // Renderer convention: n = (cosφ·cosλ', sinφ, cosφ·sinλ') where the
+        // mesh applies +gmst to Earth-fixed lon. ECI (x,y,z) with -gmst gives
+        // (xr, z-height, yr) in that convention: x̂=cosφ·cosλ', ŷ=sinφ (up),
+        // ẑ=cosφ·sinλ'. Map: n = (xr/rr, z/rr, yr/rr).
+        V3(xr / rr, z / rr, yr / rr)
+    };
     let mut prev: Option<(Pos2, bool)> = None;
-    for p in orbit {
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.45);
-        let (la_r, lo_r) = (
-            p.lat_deg.to_radians(),
-            (p.lon_deg + earth_rot.to_degrees()).to_radians(),
-        );
-        let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
-        let cam_v = rotate_to_cam(n, alt_r, yaw, pitch);
+    for p in orbit_eci {
+        let v = eci_to_n(p);
+        let alt = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - 6371.0;
+        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.45);
+        let cam_v = rotate_to_cam(v, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         // Occlusion: a point is hidden when it's on the far side (z < 0) AND
         // its projection lands inside the globe disc.

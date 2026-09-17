@@ -79,6 +79,35 @@ impl Propagator {
         pts
     }
 
+    /// True orbit in the inertial (TEME) frame over
+    /// `[time - past_min, time + future_min]` — positions in km, ECI axes.
+    /// This is the actual smooth elliptical orbit (unlike the ground track,
+    /// which is distorted by Earth rotation).
+    pub fn orbit_eci(
+        &self,
+        sat: &Sat,
+        time: DateTime<Utc>,
+        past_min: f64,
+        future_min: f64,
+        step_min: f64,
+    ) -> Vec<[f64; 3]> {
+        let Some(consts) = self.constants_for(sat) else {
+            return Vec::new();
+        };
+        let Some(center) = tle_minutes(&sat.tle, time) else {
+            return Vec::new();
+        };
+        let mut pts = Vec::new();
+        let mut m = center + past_min;
+        while m <= center + future_min {
+            if let Ok(pred) = consts.propagate(MinutesSinceEpoch(m)) {
+                pts.push(pred.position);
+            }
+            m += step_min;
+        }
+        pts
+    }
+
     /// Propagate all satellites' current positions (for the map view).
     pub fn all_positions(&self, sats: &[Sat], time: DateTime<Utc>) -> Vec<Option<GeoPoint>> {
         sats.iter().map(|s| self.subpoint(s, time)).collect()
