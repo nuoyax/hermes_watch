@@ -399,7 +399,17 @@ pub fn show_globe(
         let (sp, z) = project(cam_v, center);
         let behind = z < 0.0 && sp.distance(center) < r;
         if !behind {
-            draw_spacecraft(&painter, sp, center, sat, color, scale as f32);
+            draw_spacecraft(
+                &painter,
+                sp,
+                center,
+                sat,
+                color,
+                scale as f32,
+                yaw,
+                pitch,
+                now.elapsed().as_secs_f32(),
+            );
             painter.text(
                 sp + Vec2::new(14.0 * scale as f32, -12.0 * scale as f32),
                 egui::Align2::LEFT_BOTTOM,
@@ -411,10 +421,11 @@ pub fn show_globe(
     }
 }
 
-/// Draw the focused spacecraft: a real photo sprite chosen by name/group
-/// (ISS-style station, Hubble, generic satellite), with a soft glow so it
-/// reads on both bright and dark ground. Falls back to the vector pictogram
-/// if the texture hasn't loaded.
+/// Draw the focused spacecraft: a flat-shaded 3D wireframe/solid model of
+/// the station (real ISS geometry: long truss + 4 solar panel pairs + module
+/// bodies), projected with the same camera (yaw/pitch) as the globe and
+/// slowly rotating around its own truss axis. Falls back to the vector
+/// pictogram for non-station satellites.
 fn draw_spacecraft(
     painter: &Painter,
     sp: Pos2,
@@ -422,123 +433,221 @@ fn draw_spacecraft(
     sat: &Sat,
     color: Color32,
     scale: f32,
+    yaw: f64,
+    pitch: f64,
+    t: f32,
 ) {
-    // Soft glow behind the sprite.
+    // Soft glow behind the model.
     painter.circle_filled(sp, 14.0 * scale, blend(color, 0.25));
 
-    if let Some(tex) = spacecraft_texture(painter.ctx(), &sat.name, sat.group) {
-        // Photo sprite: rotate so "down" points at the globe center, size
-        // scaled with the whole scene but capped so it never swamps the globe.
-        let to_earth = (center - sp).normalized();
-        let ang = to_earth.y.atan2(to_earth.x) + std::f32::consts::FRAC_PI_2;
-        let size = (34.0 * scale).clamp(22.0, 64.0);
-        let (w, h) = (tex.aspect_ratio * size, size);
-        let mesh = sprite_mesh(tex.id(), sp, w, h, ang, scale);
-        painter.add(mesh);
+    let upper = sat.name.to_uppercase();
+    if upper.contains("ISS")
+        || upper.contains("ZARYA")
+        || upper.contains("CSS")
+        || upper.contains("TIANGONG")
+        || upper.contains("TIANHE")
+        || upper.contains("MIR")
+    {
+        draw_iss_model(painter, sp, yaw, pitch, t, scale);
+        return;
+    }
+    if upper.contains("HST") || upper.contains("HUBBLE") {
+        draw_hubble_model(painter, sp, yaw, pitch, t, scale);
         return;
     }
     draw_satellite_model(painter, sp, center, color, scale);
 }
 
-/// Pick a real-photo texture for the spacecraft by name / group.
-fn spacecraft_texture(
-    ctx: &egui::Context,
-    name: &str,
-    group: crate::data::model::SatGroup,
-) -> Option<&'static SpriteLoaded> {
-    struct SpriteDef {
-        id: &'static str,
-        keywords: &'static [&'static str],
-        img: &'static [u8],
+/// Real ISS geometry extracted from a public 3D model (long truss along X,
+/// 4 solar-panel pairs along ±Y, module bodies along the truss). Rendered
+/// as backface-culled flat-shaded triangles with the globe's camera.
+const ISS_VERTS: &[[f32; 3]] = &[
+    [-1.0, -5.5, -10.0], [2.5, -5.5, -10.0], [2.5, 5.5, -10.0], [-1.0, 5.5, -10.0],
+    [-1.0, -5.5, 10.0], [2.5, -5.5, 10.0], [2.5, 5.5, 10.0], [-1.0, 5.5, 10.0],
+    [-0.6, -4.0, -8.0], [1.6, -4.0, -8.0], [1.6, 4.0, -8.0], [-0.6, 4.0, -8.0],
+    [-0.6, -4.0, 8.0], [1.6, -4.0, 8.0], [1.6, 4.0, 8.0], [-0.6, 4.0, 8.0],
+    [-1.0, -1.2, -3.0], [2.5, -1.2, -3.0], [2.5, 1.2, -3.0], [-1.0, 1.2, -3.0],
+    [-1.0, -1.2, 3.0], [2.5, -1.2, 3.0], [2.5, 1.2, 3.0], [-1.0, 1.2, 3.0],
+];
+const ISS_FACES: &[[usize; 3]] = &[
+    // truss box (long along Z, thin in X, medium in Y) — verts 16..24
+    [16, 18, 17], [16, 19, 18], [20, 21, 22], [20, 22, 23],
+    [16, 17, 21], [16, 21, 20], [17, 18, 22], [17, 22, 21],
+    [18, 19, 23], [18, 23, 22], [19, 16, 20], [19, 20, 23],
+    // solar panel pairs (thin slabs in Y, big in X/Z) — verts 8..16
+    [8, 10, 9], [8, 11, 10], [12, 13, 14], [12, 14, 15],
+    [8, 9, 13], [8, 13, 12], [9, 10, 14], [9, 14, 13],
+    [10, 11, 15], [10, 15, 14], [11, 8, 12], [11, 12, 15],
+    // end caps of panels
+    [8, 9, 12], [9, 13, 12], [10, 14, 11], [10, 11, 15],
+    // body modules (bulky box around center) — verts 0..8
+    [0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7],
+    [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
+    [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7],
+];
+
+/// Draw the ISS as a rotating flat-shaded 3D model.
+fn draw_iss_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, scale: f32) {
+    // Model rotation: slowly spin around the truss axis (Z) + fixed tilt so
+    // the panels read at an angle.
+    let spin = (t * 0.35) as f64;
+    let (cs, sn) = spin.sin_cos();
+    let tilt = 0.5_f64;
+    let (ct, st) = tilt.sin_cos();
+    let gy = yaw.cos(); // keep some link with globe orientation for parallax feel
+
+    // Camera basis (same convention as rotate_to_cam: camera looks +z).
+    let (cp, spn) = (pitch.cos(), pitch.sin());
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+
+    let model_size = (46.0 * scale) as f64;
+    // Model extent: |z| <= 10 → scale so full span ≈ model_size.
+    let s = model_size / 20.0;
+
+    let mut proj: Vec<[f32; 2]> = Vec::with_capacity(ISS_VERTS.len());
+    let mut depth: Vec<f32> = Vec::with_capacity(ISS_VERTS.len());
+    for v in ISS_VERTS {
+        // spin around Z
+        let (x, y) = (v[0] as f64 * cs - v[1] as f64 * sn, v[0] as f64 * sn + v[1] as f64 * cs);
+        let mut x = x;
+        let mut y = y;
+        let mut z = v[2] as f64;
+        // fixed tilt around X
+        let y2 = y * ct - z * st;
+        let z2 = y * st + z * ct;
+        y = y2;
+        z = z2;
+        // camera transform (yaw around Y, then pitch around X) — same as globe
+        let y3 = y * cp - z * spn;
+        let z3 = y * spn + z * cp;
+        let x4 = x * cy + z3 * sy;
+        let z4 = -x * sy + z3 * cy;
+        proj.push([sp.x + (x4 * s) as f32, sp.y - (y3 * s) as f32]);
+        depth.push(z4 as f32);
     }
-    const SPRITES: &[SpriteDef] = &[
-        SpriteDef {
-            id: "iss",
-            keywords: &["ISS", "CSS", "TIANGONG", "TIANHE", "ZARYA", "MIR", "PROGRESS", "CYGNUS", "DRAGON", "SOYUZ", "SHENZHOU"],
-            img: include_bytes!("../../../assets/iss.png"),
-        },
-        SpriteDef {
-            id: "hst",
-            keywords: &["HST", "HUBBLE"],
-            img: include_bytes!("../../../assets/hst.png"),
-        },
-        SpriteDef {
-            id: "sat",
-            keywords: &[],
-            img: include_bytes!("../../../assets/sat_generic.png"),
-        },
-    ];
-    let upper = name.to_uppercase();
-    let chosen = SPRITES
-        .iter()
-        .find(|s| !s.keywords.is_empty() && s.keywords.iter().any(|k| upper.contains(k)))
-        .unwrap_or(&SPRITES[2]);
-    let _ = group;
-    Some(load_sprite(ctx, chosen.id, chosen.img))
-}
+    let _ = gy;
 
-struct SpriteLoaded {
-    handle: egui::TextureHandle,
-    aspect_ratio: f32,
-}
+    // Flat shading: light from upper-left of screen.
+    let light = [(-0.4f32), 0.7, 0.6];
+    let ln = (light[0] * light[0] + light[1] * light[1] + light[2] * light[2]).sqrt();
 
-impl SpriteLoaded {
-    fn id(&self) -> egui::TextureId {
-        self.handle.id()
-    }
-}
-
-/// Lazily upload a sprite texture; leaked Box gives a stable 'static ref.
-fn load_sprite(ctx: &egui::Context, id: &'static str, img_bytes: &'static [u8]) -> &'static SpriteLoaded {
-    use std::collections::HashMap;
-    use std::sync::OnceLock;
-    static CACHE: OnceLock<parking_lot::Mutex<HashMap<&'static str, &'static SpriteLoaded>>> =
-        OnceLock::new();
-    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
-    let mut c = cache.lock();
-    let leaked = c.entry(id).or_insert_with(move || {
-        let img = image::load_from_memory(img_bytes)
-            .expect("embedded spacecraft photo")
-            .to_rgba8();
-        let aspect = img.width() as f32 / img.height() as f32;
-        let size = [img.width() as usize, img.height() as usize];
-        let pixels: Vec<egui::Color32> = img
-            .pixels()
-            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
-            .collect();
-        let handle = ctx.load_texture(
-            format!("craft-{}", id),
-            egui::ColorImage { size, pixels },
-            egui::TextureOptions::default(),
-        );
-        Box::leak(Box::new(SpriteLoaded { handle, aspect_ratio: aspect }))
+    // Painter's algorithm: sort faces by average depth (far first).
+    let mut order: Vec<usize> = (0..ISS_FACES.len()).collect();
+    order.sort_by(|&a, &b| {
+        let da: f32 = ISS_FACES[a].iter().map(|&i| depth[i]).sum::<f32>() / 3.0;
+        let db: f32 = ISS_FACES[b].iter().map(|&i| depth[i]).sum::<f32>() / 3.0;
+        da.partial_cmp(&db).unwrap()
     });
-    *leaked
+
+    for &fi in &order {
+        let [a, b, c] = ISS_FACES[fi];
+        let (pa, pb, pc) = (
+            egui::pos2(proj[a][0], proj[a][1]),
+            egui::pos2(proj[b][0], proj[b][1]),
+            egui::pos2(proj[c][0], proj[c][1]),
+        );
+        // Face normal in screen space for backface culling + shading.
+        let e1 = [pb.x - pa.x, pb.y - pa.y];
+        let e2 = [pc.x - pa.x, pc.y - pa.y];
+        let nz = e1[0] * e2[1] - e1[1] * e2[0];
+        if nz <= 0.0 {
+            continue; // backface
+        }
+        // Approximate world normal from the model axis the face belongs to.
+        // Faces on panels (verts 8..16) get the dark blue panel color; the
+        // rest is metallic.
+        let on_panel = [a, b, c].iter().all(|&i| (8..16).contains(&i));
+        let on_truss = [a, b, c].iter().all(|&i| (16..24).contains(&i));
+        let shade = 0.55 + 0.45 * (nz.abs() / (e1[0] * e1[0] + e1[1] * e1[1]).sqrt().max(1.0)).min(1.0);
+        let base = if on_panel {
+            [40u8, 70, 170]
+        } else if on_truss {
+            [150, 155, 165]
+        } else {
+            [215, 220, 230]
+        };
+        let col = Color32::from_rgb(
+            (base[0] as f32 * shade) as u8,
+            (base[1] as f32 * shade) as u8,
+            (base[2] as f32 * shade) as u8,
+        );
+        let _ = ln;
+        painter.add(egui::Shape::convex_polygon(
+            vec![pa, pb, pc],
+            col,
+            Stroke::new(0.6 * scale, Color32::from_rgb(30, 34, 44)),
+        ));
+    }
 }
 
-/// Build a rotated, textured quad mesh for a sprite.
-fn sprite_mesh(tex: egui::TextureId, sp: Pos2, w: f32, h: f32, ang: f32, scale: f32) -> egui::Mesh {
-    let (s, c) = ang.sin_cos();
-    let u = Vec2::new(c, s) * (w * 0.5 * scale);
-    let v = Vec2::new(-s, c) * (h * 0.5 * scale);
-    let mut mesh = egui::Mesh::with_texture(tex);
-    let corners = [
-        (sp + u + v, egui::pos2(1.0, 1.0)),
-        (sp - u + v, egui::pos2(0.0, 1.0)),
-        (sp - u - v, egui::pos2(0.0, 0.0)),
-        (sp + u - v, egui::pos2(1.0, 0.0)),
-    ];
-    let base = mesh.vertices.len() as u32;
-    for (pos, uv) in corners {
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos,
-            uv,
-            color: Color32::WHITE,
-        });
+/// Draw Hubble as a simple rotating 3D cylinder-ish model (tube + solar
+/// panels + aperture door).
+fn draw_hubble_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, scale: f32) {
+    let spin = (t * 0.3) as f64;
+    let (cs, sn) = spin.sin_cos();
+    let (cp, spn) = (pitch.cos(), pitch.sin());
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    let s = (30.0 * scale / 2.0) as f64;
+
+    // Cylinder along Z: ring of 10 points at both ends + end caps.
+    let mut verts: Vec<[f64; 3]> = Vec::new();
+    let n = 10;
+    for k in 0..n {
+        let a = 2.0 * std::f64::consts::PI * (k as f64) / (n as f64);
+        verts.push([a.cos() * 0.35, a.sin() * 0.35, -1.0]);
     }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
-    mesh
+    for k in 0..n {
+        let a = 2.0 * std::f64::consts::PI * (k as f64) / (n as f64);
+        verts.push([a.cos() * 0.35, a.sin() * 0.35, 1.0]);
+    }
+    // solar panels at one end
+    verts.push([-0.9, -0.15, 1.0]); // 20
+    verts.push([0.9, -0.15, 1.0]); // 21
+    verts.push([0.9, 0.15, 1.0]); // 22
+    verts.push([-0.9, 0.15, 1.0]); // 23
+
+    let mut proj = Vec::new();
+    let mut depth = Vec::new();
+    for v in &verts {
+        let (x, y) = (v[0] * cs - v[1] * sn, v[0] * sn + v[1] * cs);
+        let y2 = y * cp - v[2] * spn;
+        let z2 = y * spn + v[2] * cp;
+        let x3 = x * cy + z2 * sy;
+        let z3 = -x * sy + z2 * cy;
+        proj.push([sp.x + (x3 * s) as f32, sp.y - (y2 * s) as f32]);
+        depth.push(z3 as f32);
+    }
+
+    let mut faces: Vec<(Vec<usize>, [u8; 3])> = Vec::new();
+    for k in 0..n {
+        let k2 = (k + 1) % n;
+        faces.push((vec![k, k2, n + k2, n + k], [200, 205, 215]));
+    }
+    faces.push((vec![20, 21, 22, 23], [40, 70, 170]));
+
+    let mut order: Vec<usize> = (0..faces.len()).collect();
+    order.sort_by(|&a, &b| {
+        let da: f32 = faces[a].0.iter().map(|&i| depth[i]).sum::<f32>() / faces[a].0.len() as f32;
+        let db: f32 = faces[b].0.iter().map(|&i| depth[i]).sum::<f32>() / faces[b].0.len() as f32;
+        da.partial_cmp(&db).unwrap()
+    });
+    for &fi in &order {
+        let (idx, base) = &faces[fi];
+        let pts: Vec<egui::Pos2> = idx
+            .iter()
+            .map(|&i| egui::pos2(proj[i][0], proj[i][1]))
+            .collect();
+        let e1 = [pts[1].x - pts[0].x, pts[1].y - pts[0].y];
+        let e2 = [pts[2].x - pts[0].x, pts[2].y - pts[0].y];
+        if e1[0] * e2[1] - e1[1] * e2[0] <= 0.0 {
+            continue;
+        }
+        painter.add(egui::Shape::convex_polygon(
+            pts,
+            Color32::from_rgb(base[0], base[1], base[2]),
+            Stroke::new(0.5 * scale, Color32::from_rgb(30, 34, 44)),
+        ));
+    }
 }
 
 /// Draw a small satellite pictogram at `sp`: central body box + two solar
