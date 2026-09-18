@@ -458,126 +458,139 @@ fn draw_spacecraft(
     draw_satellite_model(painter, sp, center, color, scale);
 }
 
-/// Real ISS geometry extracted from a public 3D model (long truss along X,
-/// 4 solar-panel pairs along ±Y, module bodies along the truss). Rendered
-/// as backface-culled flat-shaded triangles with the globe's camera.
-const ISS_VERTS: &[[f32; 3]] = &[
-    [-1.0, -5.5, -10.0], [2.5, -5.5, -10.0], [2.5, 5.5, -10.0], [-1.0, 5.5, -10.0],
-    [-1.0, -5.5, 10.0], [2.5, -5.5, 10.0], [2.5, 5.5, 10.0], [-1.0, 5.5, 10.0],
-    [-0.6, -4.0, -8.0], [1.6, -4.0, -8.0], [1.6, 4.0, -8.0], [-0.6, 4.0, -8.0],
-    [-0.6, -4.0, 8.0], [1.6, -4.0, 8.0], [1.6, 4.0, 8.0], [-0.6, 4.0, 8.0],
-    [-1.0, -1.2, -3.0], [2.5, -1.2, -3.0], [2.5, 1.2, -3.0], [-1.0, 1.2, -3.0],
-    [-1.0, -1.2, 3.0], [2.5, -1.2, 3.0], [2.5, 1.2, 3.0], [-1.0, 1.2, 3.0],
-];
-const ISS_FACES: &[[usize; 3]] = &[
-    // truss box (long along Z, thin in X, medium in Y) — verts 16..24
-    [16, 18, 17], [16, 19, 18], [20, 21, 22], [20, 22, 23],
-    [16, 17, 21], [16, 21, 20], [17, 18, 22], [17, 22, 21],
-    [18, 19, 23], [18, 23, 22], [19, 16, 20], [19, 20, 23],
-    // solar panel pairs (thin slabs in Y, big in X/Z) — verts 8..16
-    [8, 10, 9], [8, 11, 10], [12, 13, 14], [12, 14, 15],
-    [8, 9, 13], [8, 13, 12], [9, 10, 14], [9, 14, 13],
-    [10, 11, 15], [10, 15, 14], [11, 8, 12], [11, 12, 15],
-    // end caps of panels
-    [8, 9, 12], [9, 13, 12], [10, 14, 11], [10, 11, 15],
-    // body modules (bulky box around center) — verts 0..8
-    [0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7],
-    [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
-    [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7],
-];
+/// Real ISS geometry baked from the public SpaceX ISS docking simulator model
+/// (github.com/matthewgiarra/spacex-iss-sim, `iss_mobile.glb`): full truss,
+/// 8 solar array wings, pressurized modules. Baked to a compact binary mesh
+/// with Python (scene-graph transformed, area-weighted decimated to 28k tris).
+/// Binary layout: 24-byte header [f32 cx, cy, cz; f32 ext; u32 nverts, ntris],
+/// then nverts × f32×3 (pre-centered, divided by ext), then ntris ×
+/// [u32 a, b, c + u8 r, g, b].
+const ISS_MODEL_BIN: &[u8] = include_bytes!("../../../assets/iss_model.bin");
 
-/// Draw the ISS as a rotating flat-shaded 3D model.
+struct IssMesh {
+    verts: Vec<[f32; 3]>,
+    tris: Vec<([u32; 3], [u8; 3])>,
+}
+
+/// Parse the baked binary once and cache it for every frame.
+fn iss_mesh() -> &'static IssMesh {
+    static MESH: std::sync::OnceLock<IssMesh> = std::sync::OnceLock::new();
+    MESH.get_or_init(|| {
+        let rd = |off: usize| -> f32 {
+            f32::from_le_bytes(ISS_MODEL_BIN[off..off + 4].try_into().unwrap())
+        };
+        let ru = |off: usize| -> u32 {
+            u32::from_le_bytes(ISS_MODEL_BIN[off..off + 4].try_into().unwrap())
+        };
+        let nverts = ru(16) as usize;
+        let ntris = ru(20) as usize;
+        let vbase = 24;
+        let mut verts = Vec::with_capacity(nverts);
+        for i in 0..nverts {
+            let o = vbase + i * 12;
+            verts.push([rd(o), rd(o + 4), rd(o + 8)]);
+        }
+        let tbase = vbase + nverts * 12;
+        let mut tris = Vec::with_capacity(ntris);
+        for i in 0..ntris {
+            let o = tbase + i * 15;
+            tris.push((
+                [ru(o), ru(o + 4), ru(o + 8)],
+                [ISS_MODEL_BIN[o + 12], ISS_MODEL_BIN[o + 13], ISS_MODEL_BIN[o + 14]],
+            ));
+        }
+        IssMesh { verts, tris }
+    })
+}
+
+/// Draw the ISS as a rotating flat-shaded 3D model from the baked mesh.
 fn draw_iss_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, scale: f32) {
-    // Model rotation: slowly spin around the truss axis (Z) + fixed tilt so
+    let mesh_data = iss_mesh();
+    // Model rotation: slow spin around the truss axis (Z) + fixed tilt so
     // the panels read at an angle.
     let spin = (t * 0.35) as f64;
     let (cs, sn) = spin.sin_cos();
     let tilt = 0.5_f64;
     let (ct, st) = tilt.sin_cos();
-    let gy = yaw.cos(); // keep some link with globe orientation for parallax feel
 
     // Camera basis (same convention as rotate_to_cam: camera looks +z).
     let (cp, spn) = (pitch.cos(), pitch.sin());
     let (cy, sy) = (yaw.cos(), yaw.sin());
 
     let model_size = (46.0 * scale) as f64;
-    // Model extent: |z| <= 10 → scale so full span ≈ model_size.
-    let s = model_size / 20.0;
+    // Verts are normalized to [-0.5, 0.5] (divided by extent at bake time),
+    // so the full span is 1 unit → scale directly by model_size.
+    let s = model_size;
 
-    let mut proj: Vec<[f32; 2]> = Vec::with_capacity(ISS_VERTS.len());
-    let mut depth: Vec<f32> = Vec::with_capacity(ISS_VERTS.len());
-    for v in ISS_VERTS {
-        // spin around Z
-        let (x, y) = (v[0] as f64 * cs - v[1] as f64 * sn, v[0] as f64 * sn + v[1] as f64 * cs);
-        let mut x = x;
-        let mut y = y;
-        let mut z = v[2] as f64;
-        // fixed tilt around X
-        let y2 = y * ct - z * st;
-        let z2 = y * st + z * ct;
-        y = y2;
-        z = z2;
-        // camera transform (yaw around Y, then pitch around X) — same as globe
-        let y3 = y * cp - z * spn;
-        let z3 = y * spn + z * cp;
-        let x4 = x * cy + z3 * sy;
-        let z4 = -x * sy + z3 * cy;
-        proj.push([sp.x + (x4 * s) as f32, sp.y - (y3 * s) as f32]);
-        depth.push(z4 as f32);
-    }
-    let _ = gy;
+    // Transform all vertices once per frame.
+    let proj: Vec<[f32; 2]> = mesh_data
+        .verts
+        .iter()
+        .map(|v| {
+            // spin around Z
+            let (x, y) = (
+                v[0] as f64 * cs - v[1] as f64 * sn,
+                v[0] as f64 * sn + v[1] as f64 * cs,
+            );
+            // fixed tilt around X
+            let y2 = y * ct - v[2] as f64 * st;
+            let z2 = y * st + v[2] as f64 * ct;
+            // camera transform (yaw around Y, then pitch around X) — same as globe
+            let y3 = y2 * cp - z2 * spn;
+            let z3 = y2 * spn + z2 * cp;
+            let x4 = x * cy + z3 * sy;
+            let _ = -x * sy + z3 * cy;
+            [sp.x + (x4 * s) as f32, sp.y - (y3 * s) as f32]
+        })
+        .collect();
 
-    // Flat shading: light from upper-left of screen.
-    let light = [(-0.4f32), 0.7, 0.6];
-    let ln = (light[0] * light[0] + light[1] * light[1] + light[2] * light[2]).sqrt();
+    // Backface culling: skip degenerate/wound-away triangles. Depth: use the
+    // rotated model z (post spin+tilt) averaged per tri, painted far first.
+    let rotated_z: Vec<f32> = mesh_data
+        .verts
+        .iter()
+        .map(|v| {
+            (v[0] as f64 * sn + v[1] as f64 * cs) * st + v[2] as f64 * ct
+        } as f32)
+        .collect();
 
-    // Painter's algorithm: sort faces by average depth (far first).
-    let mut order: Vec<usize> = (0..ISS_FACES.len()).collect();
+    let nz_of = |tri: &[u32; 3]| -> f32 {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let e1 = [proj[b][0] - proj[a][0], proj[b][1] - proj[a][1]];
+        let e2 = [proj[c][0] - proj[a][0], proj[c][1] - proj[a][1]];
+        e1[0] * e2[1] - e1[1] * e2[0]
+    };
+
+    let mut order: Vec<usize> = (0..mesh_data.tris.len()).collect();
+    order.retain(|&i| nz_of(&mesh_data.tris[i].0) > 0.0);
     order.sort_by(|&a, &b| {
-        let da: f32 = ISS_FACES[a].iter().map(|&i| depth[i]).sum::<f32>() / 3.0;
-        let db: f32 = ISS_FACES[b].iter().map(|&i| depth[i]).sum::<f32>() / 3.0;
-        da.partial_cmp(&db).unwrap()
+        let da = rotated_z[mesh_data.tris[a].0[0] as usize];
+        let db = rotated_z[mesh_data.tris[b].0[0] as usize];
+        db.partial_cmp(&da).unwrap()
     });
 
-    for &fi in &order {
-        let [a, b, c] = ISS_FACES[fi];
-        let (pa, pb, pc) = (
-            egui::pos2(proj[a][0], proj[a][1]),
-            egui::pos2(proj[b][0], proj[b][1]),
-            egui::pos2(proj[c][0], proj[c][1]),
-        );
-        // Face normal in screen space for backface culling + shading.
-        let e1 = [pb.x - pa.x, pb.y - pa.y];
-        let e2 = [pc.x - pa.x, pc.y - pa.y];
-        let nz = e1[0] * e2[1] - e1[1] * e2[0];
-        if nz <= 0.0 {
-            continue; // backface
-        }
-        // Approximate world normal from the model axis the face belongs to.
-        // Faces on panels (verts 8..16) get the dark blue panel color; the
-        // rest is metallic.
-        let on_panel = [a, b, c].iter().all(|&i| (8..16).contains(&i));
-        let on_truss = [a, b, c].iter().all(|&i| (16..24).contains(&i));
-        let shade = 0.55 + 0.45 * (nz.abs() / (e1[0] * e1[0] + e1[1] * e1[1]).sqrt().max(1.0)).min(1.0);
-        let base = if on_panel {
-            [40u8, 70, 170]
-        } else if on_truss {
-            [150, 155, 165]
-        } else {
-            [215, 220, 230]
-        };
+    // Build one egui mesh: 3 fresh vertices per triangle (flat shading).
+    let mut mesh = egui::Mesh::default();
+    mesh.vertices.reserve(order.len() * 3);
+    mesh.indices.reserve(order.len() * 3);
+    for &ti in &order {
+        let (idx, base) = &mesh_data.tris[ti];
+        let nz = nz_of(idx);
+        let shade = 0.55 + 0.45 * (nz / (nz * nz + 1.0).sqrt()).min(1.0);
         let col = Color32::from_rgb(
             (base[0] as f32 * shade) as u8,
             (base[1] as f32 * shade) as u8,
             (base[2] as f32 * shade) as u8,
         );
-        let _ = ln;
-        painter.add(egui::Shape::convex_polygon(
-            vec![pa, pb, pc],
-            col,
-            Stroke::new(0.6 * scale, Color32::from_rgb(30, 34, 44)),
-        ));
+        let base_vi = mesh.vertices.len() as u32;
+        for &i in idx.iter() {
+            let p = proj[i as usize];
+            mesh.colored_vertex(egui::pos2(p[0], p[1]), col);
+        }
+        mesh.indices
+            .extend_from_slice(&[base_vi, base_vi + 1, base_vi + 2]);
     }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Draw Hubble as a simple rotating 3D cylinder-ish model (tube + solar
