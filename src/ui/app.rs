@@ -111,9 +111,15 @@ impl App {
             });
         if !fresh {
             // True inertial orbit: one full revolution centred on the sim
-            // time, smooth (94 points over ~95 min for LEO).
-            let period_hint = 95.0; // minutes of half revolution — covers LEO..MEO nicely
-            let track = prop.orbit_eci(sat, sim_time, -period_hint, period_hint, 2.0);
+            // time. Period comes from the TLE's mean motion so GEO (~1436
+            // min) gets a complete ring too, not just LEO.
+            let revs_per_day = sat.tle.mean_motion_revs_per_day().unwrap_or(14.0);
+            let period_min = (1440.0 / revs_per_day).clamp(88.0, 1600.0);
+            let half = period_min / 2.0 + 2.0;
+            // Step scales with the period so a ring always has ~500 points:
+            // 0.25 min for LEO, ~3 min for GEO — smooth everywhere.
+            let step = (period_min / 500.0).clamp(0.25, 3.0);
+            let track = prop.orbit_eci(sat, sim_time, -half, half, step);
             pane.orbit_cache = Some((
                 sat.norad_id,
                 std::time::Instant::now(),
@@ -370,8 +376,10 @@ impl App {
                     self.selected = Some(norad);
                     // Focus the active pane.
                     self.panes[self.active_pane].focus_norad = Some(norad);
-                    if self.panes[self.active_pane].view == ViewKind::WorldMap {
-                        self.panes[self.active_pane].view = ViewKind::GroundTrack;
+                    // Default to 3D: clicking a satellite in the sidebar
+                    // brings the active pane back to the 3D globe view.
+                    if self.panes[self.active_pane].view != ViewKind::Globe3D {
+                        self.panes[self.active_pane].view = ViewKind::Globe3D;
                     }
                 }
             });

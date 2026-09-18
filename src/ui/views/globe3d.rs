@@ -65,9 +65,9 @@ impl GlobeState {
     /// after interaction.
     #[cfg(test)]
     pub(crate) fn effective_yaw_for_test(&self, now: std::time::Instant, gmst: f64) -> f64 {
-        self.effective_yaw(now, gmst)
+        self.effective_yaw(now, gmst, 0.0)
     }
-    fn effective_yaw(&self, now: std::time::Instant, gmst: f64) -> f64 {
+    fn effective_yaw(&self, now: std::time::Instant, gmst: f64, sun_yaw: f64) -> f64 {
         if let Some(lon) = self.lock_lon {
             // Mesh places Earth-fixed lon L at world longitude (L + gmst).
             // rotate_to_cam maps world lon W to camera angle (W - yaw); the
@@ -84,7 +84,8 @@ impl GlobeState {
             // Hold still right after a drag — no drift.
             return self.yaw;
         }
-        self.yaw
+        // Free camera drifts gently back toward the sun-facing yaw.
+        sun_yaw
     }
 
     /// Auto-reset: 5 s after the last manual drag, ease the camera back to
@@ -202,9 +203,15 @@ pub fn show_globe(
     // model, orbit line, labels) scales together with the zoom level.
     let scale = (r / 150.0).clamp(0.25, 3.5);
     let now = std::time::Instant::now();
-    // 5 s after the last drag, ease back to the default view.
-    cam.auto_reset(0.0);
-    let yaw = cam.effective_yaw(now, earth_rot);
+    // Default view = from the sun's side: the lit hemisphere faces the
+    // viewer. The camera yaw tracks the subsolar point (world angle =
+    // subsolar lon + GMST; the camera sits at world +90°), so as time
+    // passes the view slowly follows the sun like a solar-locked observer.
+    // A manual drag overrides it freely; auto-reset glides back to the sun.
+    let sun_yaw = sun_dir_ef.0.atan2(sun_dir_ef.2) + earth_rot
+        - std::f64::consts::FRAC_PI_2;
+    cam.auto_reset(sun_yaw);
+    let yaw = cam.effective_yaw(now, earth_rot, sun_yaw);
     cam.current_yaw = yaw; // remember for a smooth release of the follow-lock
     let pitch = cam.pitch;
 
@@ -232,62 +239,86 @@ pub fn show_globe(
     );
     let sun_norm = sun_world.dot(sun_world).sqrt();
     let tex = earth.texture(painter.ctx());
-    let (lat_bands, lon_bands) = (48usize, 96usize);
-    let mut vertices: Vec<egui::epaint::Vertex> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-
-    for la in 0..=lat_bands {
-        let lat = -90.0 + 180.0 * la as f64 / lat_bands as f64;
-        for lo in 0..=lon_bands {
-            let lon = -180.0 + 360.0 * lo as f64 / lon_bands as f64;
-            // Surface normal in Earth-fixed frame (with GMST rotation applied,
-            // since the texture is Earth-fixed too — camera spin comes from yaw).
-            // Geometry normal carries GMST (Earth-fixed texture in world frame).
-            let (la_r, lo_r) = (lat.to_radians(), (lon + earth_rot.to_degrees()).to_radians());
-            let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
-            let cam_v = rotate_to_cam(n, r as f64, yaw, pitch);
-            let (pos, _z) = project(cam_v, center);
-
-            // Lighting: sun fixed in the WORLD (inertial) frame, normal in
-            // the same world frame as the mesh geometry — dragging spins the
-            // whole lit pattern with the Earth, with zero lag.
-            let n_world = n; // mesh normal already includes the GMST term
-            let d = n_world.dot(sun_world).clamp(0.0, 1.0) / sun_norm;
-            let shade = 0.10 + 0.92 * d;
-            let c = Color32::from_rgba_unmultiplied(
-                (255.0 * shade) as u8,
-                (255.0 * shade) as u8,
-                (255.0 * shade) as u8,
-                255,
-            );
-
-            // UV: equirectangular.
-            let uv = egui::Pos2::new(
-                ((lon + 180.0) / 360.0) as f32,
-                ((90.0 - lat) / 180.0) as f32,
-            );
-            vertices.push(egui::epaint::Vertex {
-                pos,
-                uv,
-                color: c,
-            });
-        }
+    let (lat_bands, lon_bands) = (72usize, 144usize);
+    // Rebuild the sphere mesh only when the camera/sun/earth-rotation actually
+    // changed; otherwise replay the cached mesh. This keeps the CPU cost at
+    // ~10.5k vertex evaluations per pane only on moving frames (drag, sim
+    // clock) — static frames are free.
+    let mesh_key = (
+        yaw.to_bits(),
+        pitch.to_bits(),
+        r.to_bits(),
+        sun_dir_ef.0.to_bits(),
+        sun_dir_ef.1.to_bits(),
+        sun_dir_ef.2.to_bits(),
+        earth_rot.to_bits(),
+    );
+    thread_local! {
+        static MESH_CACHE: std::cell::RefCell<Option<((u64, u64, u32, u64, u64, u64, u64), egui::Mesh)>> =
+            const { std::cell::RefCell::new(None) };
     }
-    let stride = lon_bands + 1;
-    for la in 0..lat_bands {
-        for lo in 0..lon_bands {
-            let a = (la * stride + lo) as u32;
-            let b = a + 1;
-            let c_ = a + stride as u32;
-            let d = c_ + 1;
-            indices.extend_from_slice(&[a, c_, b, b, c_, d]);
+    let mesh_changed = MESH_CACHE
+        .with(|c| c.borrow().as_ref().map_or(true, |(k, _)| *k != mesh_key));
+    if mesh_changed {
+        let mut vertices: Vec<egui::epaint::Vertex> = Vec::with_capacity((lat_bands + 1) * (lon_bands + 1));
+        let mut indices: Vec<u32> = Vec::new();
+        let gdeg = earth_rot.to_degrees();
+        for la in 0..=lat_bands {
+            let lat = -90.0 + 180.0 * la as f64 / lat_bands as f64;
+            for lo in 0..=lon_bands {
+                let lon = -180.0 + 360.0 * lo as f64 / lon_bands as f64;
+                // Surface normal in Earth-fixed frame (with GMST rotation
+                // applied, since the texture is Earth-fixed too — camera
+                // spin comes from yaw).
+                let (la_r, lo_r) = (lat.to_radians(), (lon + gdeg).to_radians());
+                let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+                let cam_v = rotate_to_cam(n, r as f64, yaw, pitch);
+                let (pos, _z) = project(cam_v, center);
+
+                // Lighting: sun fixed in the WORLD frame.
+                let d = n.dot(sun_world).clamp(0.0, 1.0) / sun_norm;
+                let shade = 0.10 + 0.92 * d;
+                let c = Color32::from_rgba_unmultiplied(
+                    (255.0 * shade) as u8,
+                    (255.0 * shade) as u8,
+                    (255.0 * shade) as u8,
+                    255,
+                );
+
+                // UV: equirectangular.
+                let uv = egui::Pos2::new(
+                    ((lon + 180.0) / 360.0) as f32,
+                    ((90.0 - lat) / 180.0) as f32,
+                );
+                vertices.push(egui::epaint::Vertex { pos, uv, color: c });
+            }
         }
+        let stride = lon_bands + 1;
+        for la in 0..lat_bands {
+            for lo in 0..lon_bands {
+                let a = (la * stride + lo) as u32;
+                let b = a + 1;
+                let c_ = a + stride as u32;
+                let d = c_ + 1;
+                indices.extend_from_slice(&[a, c_, b, b, c_, d]);
+            }
+        }
+        let mesh = egui::Mesh {
+            vertices,
+            indices,
+            texture_id: tex.id(),
+        };
+        MESH_CACHE.with(|c| {
+            *c.borrow_mut() = Some((mesh_key, mesh.clone()));
+        });
+        painter.add(mesh);
+    } else {
+        MESH_CACHE.with(|c| {
+            if let Some((_, m)) = c.borrow().as_ref() {
+                painter.add(m.clone());
+            }
+        });
     }
-    painter.add(egui::Mesh {
-        vertices,
-        indices,
-        texture_id: tex.id(),
-    });
 
     // Subtle atmosphere terminator glow on the night side edge.
     // (skip — the vertex shading handles it)
@@ -312,32 +343,53 @@ pub fn show_globe(
         V3(x / rr, z / rr, y / rr)
     };
     let mut prev: Option<(Pos2, bool)> = None;
+    // Collect consecutive visible points into runs, then draw each run as a
+    // single smooth polyline (one shape = uniform joints, no dotted look).
+    let mut runs: Vec<Vec<Pos2>> = Vec::new();
     for p in orbit_eci {
         let v = eci_to_n(p);
         let alt = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - 6371.0;
-        // Moderate exaggeration: the ring stays fully inside the pane while
-        // LEO orbits still clear the surface (displayed km values stay true).
-        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.75);
+        // Modest exaggeration: hugs the globe visually while LEO orbits still
+        // clear the surface (displayed km values stay true).
+        let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.4);
         let cam_v = rotate_to_cam(v, alt_r, yaw, pitch);
         let cur = project(cam_v, center);
         // Occlusion: a point is hidden when it's on the far side (z < 0) AND
         // its projection lands inside the globe disc.
         let visible = cur.1 > 0.0 || cur.0.distance(center) > r;
-        if let Some((a, az)) = prev {
-            if az && visible {
-                painter.line_segment([a, cur.0], Stroke::new(2.5 * scale as f32, blend(Color32::WHITE, 0.10)));
-                painter.line_segment([a, cur.0], Stroke::new((0.6 * scale as f32).max(0.4), blend(Color32::WHITE, 0.80)));
+        if visible {
+            match runs.last_mut() {
+                Some(run) if prev.is_some() => run.push(cur.0),
+                _ => runs.push(vec![cur.0]),
             }
+        } else {
+            runs.push(Vec::new()); // break the polyline at the globe's edge
         }
         prev = Some((cur.0, visible));
+    }
+    let _ = prev;
+    // Glow pass for depth, then a crisp core line. Widths scale with zoom but
+    // never fall below ~1 px, so dense points join into a smooth curve
+    // instead of reading as separate dots.
+    for run in &runs {
+        if run.len() < 2 {
+            continue;
+        }
+        painter.add(egui::Shape::line(
+            run.clone(),
+            Stroke::new((1.6 * scale as f32).max(1.0), blend(Color32::WHITE, 0.10)),
+        ));
+        painter.add(egui::Shape::line(
+            run.clone(),
+            Stroke::new((0.7 * scale as f32).max(0.8), blend(Color32::WHITE, 0.85)),
+        ));
     }
 
     // The satellite: simple 3D model (body + two solar panels) oriented
     // toward Earth, like the classic satellite pictogram, plus label.
     if let Some(p) = sat_pos {
-        // Same exaggerated altitude scaling as the orbit ring — so the
-        // marker rides exactly on the ring (displayed km values stay true).
-        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.75);
+        // Same exaggeration as the orbit ring so the marker stays on it.
+        let alt_r = (r as f64) * (1.0 + p.alt_km / 6371.0 * 0.4);
         let (la_r, lo_r) = (
             p.lat_deg.to_radians(),
             (p.lon_deg + earth_rot.to_degrees()).to_radians(),
@@ -347,7 +399,7 @@ pub fn show_globe(
         let (sp, z) = project(cam_v, center);
         let behind = z < 0.0 && sp.distance(center) < r;
         if !behind {
-            draw_satellite_model(&painter, sp, center, color, scale as f32);
+            draw_spacecraft(&painter, sp, center, sat, color, scale as f32);
             painter.text(
                 sp + Vec2::new(14.0 * scale as f32, -12.0 * scale as f32),
                 egui::Align2::LEFT_BOTTOM,
@@ -357,6 +409,136 @@ pub fn show_globe(
             );
         }
     }
+}
+
+/// Draw the focused spacecraft: a real photo sprite chosen by name/group
+/// (ISS-style station, Hubble, generic satellite), with a soft glow so it
+/// reads on both bright and dark ground. Falls back to the vector pictogram
+/// if the texture hasn't loaded.
+fn draw_spacecraft(
+    painter: &Painter,
+    sp: Pos2,
+    center: Pos2,
+    sat: &Sat,
+    color: Color32,
+    scale: f32,
+) {
+    // Soft glow behind the sprite.
+    painter.circle_filled(sp, 14.0 * scale, blend(color, 0.25));
+
+    if let Some(tex) = spacecraft_texture(painter.ctx(), &sat.name, sat.group) {
+        // Photo sprite: rotate so "down" points at the globe center, size
+        // scaled with the whole scene but capped so it never swamps the globe.
+        let to_earth = (center - sp).normalized();
+        let ang = to_earth.y.atan2(to_earth.x) + std::f32::consts::FRAC_PI_2;
+        let size = (34.0 * scale).clamp(22.0, 64.0);
+        let (w, h) = (tex.aspect_ratio * size, size);
+        let mesh = sprite_mesh(tex.id(), sp, w, h, ang, scale);
+        painter.add(mesh);
+        return;
+    }
+    draw_satellite_model(painter, sp, center, color, scale);
+}
+
+/// Pick a real-photo texture for the spacecraft by name / group.
+fn spacecraft_texture(
+    ctx: &egui::Context,
+    name: &str,
+    group: crate::data::model::SatGroup,
+) -> Option<&'static SpriteLoaded> {
+    struct SpriteDef {
+        id: &'static str,
+        keywords: &'static [&'static str],
+        img: &'static [u8],
+    }
+    const SPRITES: &[SpriteDef] = &[
+        SpriteDef {
+            id: "iss",
+            keywords: &["ISS", "CSS", "TIANGONG", "TIANHE", "ZARYA", "MIR", "PROGRESS", "CYGNUS", "DRAGON", "SOYUZ", "SHENZHOU"],
+            img: include_bytes!("../../../assets/iss.png"),
+        },
+        SpriteDef {
+            id: "hst",
+            keywords: &["HST", "HUBBLE"],
+            img: include_bytes!("../../../assets/hst.png"),
+        },
+        SpriteDef {
+            id: "sat",
+            keywords: &[],
+            img: include_bytes!("../../../assets/sat_generic.png"),
+        },
+    ];
+    let upper = name.to_uppercase();
+    let chosen = SPRITES
+        .iter()
+        .find(|s| !s.keywords.is_empty() && s.keywords.iter().any(|k| upper.contains(k)))
+        .unwrap_or(&SPRITES[2]);
+    let _ = group;
+    Some(load_sprite(ctx, chosen.id, chosen.img))
+}
+
+struct SpriteLoaded {
+    handle: egui::TextureHandle,
+    aspect_ratio: f32,
+}
+
+impl SpriteLoaded {
+    fn id(&self) -> egui::TextureId {
+        self.handle.id()
+    }
+}
+
+/// Lazily upload a sprite texture; leaked Box gives a stable 'static ref.
+fn load_sprite(ctx: &egui::Context, id: &'static str, img_bytes: &'static [u8]) -> &'static SpriteLoaded {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<parking_lot::Mutex<HashMap<&'static str, &'static SpriteLoaded>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    let mut c = cache.lock();
+    let leaked = c.entry(id).or_insert_with(move || {
+        let img = image::load_from_memory(img_bytes)
+            .expect("embedded spacecraft photo")
+            .to_rgba8();
+        let aspect = img.width() as f32 / img.height() as f32;
+        let size = [img.width() as usize, img.height() as usize];
+        let pixels: Vec<egui::Color32> = img
+            .pixels()
+            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+            .collect();
+        let handle = ctx.load_texture(
+            format!("craft-{}", id),
+            egui::ColorImage { size, pixels },
+            egui::TextureOptions::default(),
+        );
+        Box::leak(Box::new(SpriteLoaded { handle, aspect_ratio: aspect }))
+    });
+    *leaked
+}
+
+/// Build a rotated, textured quad mesh for a sprite.
+fn sprite_mesh(tex: egui::TextureId, sp: Pos2, w: f32, h: f32, ang: f32, scale: f32) -> egui::Mesh {
+    let (s, c) = ang.sin_cos();
+    let u = Vec2::new(c, s) * (w * 0.5 * scale);
+    let v = Vec2::new(-s, c) * (h * 0.5 * scale);
+    let mut mesh = egui::Mesh::with_texture(tex);
+    let corners = [
+        (sp + u + v, egui::pos2(1.0, 1.0)),
+        (sp - u + v, egui::pos2(0.0, 1.0)),
+        (sp - u - v, egui::pos2(0.0, 0.0)),
+        (sp + u - v, egui::pos2(1.0, 0.0)),
+    ];
+    let base = mesh.vertices.len() as u32;
+    for (pos, uv) in corners {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos,
+            uv,
+            color: Color32::WHITE,
+        });
+    }
+    mesh.indices
+        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    mesh
 }
 
 /// Draw a small satellite pictogram at `sp`: central body box + two solar

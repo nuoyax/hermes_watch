@@ -36,6 +36,16 @@ impl Tle {
         let day: f64 = l[20..32].trim().parse().ok()?;
         Some((year, day))
     }
+
+    /// Mean motion (revolutions per day) from columns 53-63 of line 2.
+    /// Used to derive the true orbital period for full-revolution drawing.
+    pub fn mean_motion_revs_per_day(&self) -> Option<f64> {
+        let l = &self.line2;
+        if l.len() < 63 {
+            return None;
+        }
+        l[52..63].trim().parse().ok()
+    }
 }
 
 /// Satellite category.
