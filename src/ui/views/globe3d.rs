@@ -409,6 +409,7 @@ pub fn show_globe(
                 yaw,
                 pitch,
                 now.elapsed().as_secs_f32(),
+                sun_world,
             );
             painter.text(
                 sp + Vec2::new(14.0 * scale as f32, -12.0 * scale as f32),
@@ -436,6 +437,7 @@ fn draw_spacecraft(
     yaw: f64,
     pitch: f64,
     t: f32,
+    sun_world: V3,
 ) {
     // Soft glow behind the model.
     painter.circle_filled(sp, 14.0 * scale, blend(color, 0.25));
@@ -448,7 +450,7 @@ fn draw_spacecraft(
         || upper.contains("TIANHE")
         || upper.contains("MIR")
     {
-        draw_iss_model(painter, sp, yaw, pitch, t, scale);
+        draw_iss_model(painter, sp, yaw, pitch, t, scale, sun_world);
         return;
     }
     if upper.contains("HST") || upper.contains("HUBBLE") {
@@ -465,7 +467,7 @@ fn draw_spacecraft(
 /// Binary layout: 24-byte header [f32 cx, cy, cz; f32 ext; u32 nverts, ntris],
 /// then nverts × f32×3 (pre-centered, divided by ext), then ntris ×
 /// [u32 a, b, c + u8 r, g, b].
-const ISS_MODEL_BIN: &[u8] = include_bytes!("../../../assets/iss_model.bin");
+const ISS_MODEL_BIN: &[u8] = include_bytes!("../../../assets/iss_model_nasa.bin");
 
 struct IssMesh {
     verts: Vec<[f32; 3]>,
@@ -504,7 +506,17 @@ fn iss_mesh() -> &'static IssMesh {
 }
 
 /// Draw the ISS as a rotating flat-shaded 3D model from the baked mesh.
-fn draw_iss_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, scale: f32) {
+/// Lighting: sun-direction Lambert from the same `sun_world` used for the
+/// globe, so the station shows a real day/night side like the Earth.
+fn draw_iss_model(
+    painter: &Painter,
+    sp: Pos2,
+    yaw: f64,
+    pitch: f64,
+    t: f32,
+    scale: f32,
+    sun_world: V3,
+) {
     let mesh_data = iss_mesh();
     // Model rotation: slow spin around the truss axis (Z) + fixed tilt so
     // the panels read at an angle.
@@ -522,8 +534,10 @@ fn draw_iss_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, sca
     // so the full span is 1 unit → scale directly by model_size.
     let s = model_size;
 
-    // Transform all vertices once per frame.
-    let proj: Vec<[f32; 2]> = mesh_data
+    // Transform all vertices once per frame (spin+tilt, then camera yaw/pitch).
+    // Keep the spin+tilt-space 3D coords so per-tri normals can be lit by the
+    // real sun direction.
+    let rot3: Vec<[f64; 3]> = mesh_data
         .verts
         .iter()
         .map(|v| {
@@ -535,14 +549,29 @@ fn draw_iss_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, sca
             // fixed tilt around X
             let y2 = y * ct - v[2] as f64 * st;
             let z2 = y * st + v[2] as f64 * ct;
+            [x, y2, z2]
+        })
+        .collect();
+
+    let proj: Vec<[f32; 2]> = rot3
+        .iter()
+        .map(|v| {
             // camera transform (yaw around Y, then pitch around X) — same as globe
-            let y3 = y2 * cp - z2 * spn;
-            let z3 = y2 * spn + z2 * cp;
-            let x4 = x * cy + z3 * sy;
-            let _ = -x * sy + z3 * cy;
+            let y3 = v[1] * cp - v[2] * spn;
+            let z3 = v[1] * spn + v[2] * cp;
+            let x4 = v[0] * cy + z3 * sy;
             [sp.x + (x4 * s) as f32, sp.y - (y3 * s) as f32]
         })
         .collect();
+
+    // Inverse camera rotation (camera space → world) for normals, and the
+    // normalized sun direction in the world frame.
+    let sun_len = (sun_world.0 * sun_world.0
+        + sun_world.1 * sun_world.1
+        + sun_world.2 * sun_world.2)
+        .sqrt()
+        .max(1e-9);
+    let (sux, suy, suz) = (sun_world.0 / sun_len, sun_world.1 / sun_len, sun_world.2 / sun_len);
 
     // Backface culling: skip degenerate/wound-away triangles. Depth: use the
     // rotated model z (post spin+tilt) averaged per tri, painted far first.
@@ -575,8 +604,36 @@ fn draw_iss_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, sca
     mesh.indices.reserve(order.len() * 3);
     for &ti in &order {
         let (idx, base) = &mesh_data.tris[ti];
-        let nz = nz_of(idx);
-        let shade = 0.55 + 0.45 * (nz / (nz * nz + 1.0).sqrt()).min(1.0);
+        let nz = nz_of(idx) as f64;
+        // Real sun Lambert: world-space normal from the spin+tilt coords,
+        // then through the camera rotation (pitch then yaw, matching
+        // rotate_to_cam), dotted with the sun direction. Plus a mild
+        // screen-space term so geometry stays readable on the night side.
+        let (a, b, c) = (
+            rot3[idx[0] as usize],
+            rot3[idx[1] as usize],
+            rot3[idx[2] as usize],
+        );
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        // world normal = cross(e1, e2) pushed through camera rotation
+        let nx0 = e1[1] * e2[2] - e1[2] * e2[1];
+        let ny0 = e1[2] * e2[0] - e1[0] * e2[2];
+        let nz0 = e1[0] * e2[1] - e1[1] * e2[0];
+        // pitch around X
+        let ny1 = ny0 * cp - nz0 * spn;
+        let nz1 = ny0 * spn + nz0 * cp;
+        // yaw around Y
+        let nx = nx0 * cy + nz1 * sy;
+        let d = (nx * sux + ny1 * suy + nz1 * suz).clamp(-1.0, 1.0);
+        let facing = (nz / (nz * nz + 1.0).sqrt()).min(1.0) as f64;
+        let shade = if d > 0.0 {
+            (0.35 + 0.65 * d) * (0.75 + 0.25 * facing)
+        } else {
+            // night side: dim but not black, keep a hint of the silhouette
+            0.18 + 0.10 * facing
+        };
+        let shade = shade as f32;
         let col = Color32::from_rgb(
             (base[0] as f32 * shade) as u8,
             (base[1] as f32 * shade) as u8,
