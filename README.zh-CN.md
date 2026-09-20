@@ -59,6 +59,18 @@ cargo run --release
 
 > 需要 stable Rust 工具链（Windows 上为 MSVC target）。首次构建需数分钟，之后增量编译很快。
 
+### 测试
+
+```sh
+# 全部测试 — lib + bin 两个 target
+cargo test
+
+# 仅 lib target
+cargo test --lib
+```
+
+`cargo test` 会同时覆盖 lib 与 bin 两个 target。`src/lib.rs` 中声明了 `ui` 模块，因此 `cargo test --lib` 也会编译并运行 UI 测试（`src/ui/views/globe3d_tests.rs`）。若缺少该声明，UI 测试只会存在于 bin target 中，`--lib` 仍会显示通过，却静默跳过全部 UI 测试。
+
 ### 首次启动
 
 启动后立即并行抓取全部 6 个 Celestrak 分组。抓取期间状态栏显示进度（已完成源数 / 总数、目标数）。若某个源失败（网络受限、超时），错误会显示在状态栏，其余源正常加载。

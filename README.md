@@ -59,6 +59,18 @@ cargo run --release
 
 > Requires a stable Rust toolchain (MSVC target on Windows). First build takes a few minutes; subsequent incremental builds are fast.
 
+### Tests
+
+```sh
+# Whole suite — library + binary targets
+cargo test
+
+# Library target only
+cargo test --lib
+```
+
+`cargo test` covers both targets. `src/lib.rs` declares the `ui` module, so `cargo test --lib` also builds and runs the UI tests (`src/ui/views/globe3d_tests.rs`). Without that declaration the UI tests would exist only in the binary target and `--lib` would print a passing result while silently skipping every one of them.
+
 ### First launch
 
 On startup the app immediately fetches all 6 Celestrak groups in parallel. While fetching, the status bar shows progress (`sources done / total`, object count). If a source fails (network blocked, timeout), the error is shown in the status bar and the remaining sources still load.
