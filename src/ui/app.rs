@@ -428,7 +428,11 @@ impl App {
                     match pane.view {
                         ViewKind::Globe3D => {
                             // Interaction: drag to rotate, scroll to zoom.
-                            let resp = child.allocate_rect(child.max_rect(), egui::Sense::click_and_drag());
+                            // Explicit per-pane Id — without it the drag
+                            // interaction can be shared across panes, so
+                            // dragging one window rotates all of them.
+                            let resp = child
+                                .interact(child.max_rect(), egui::Id::new(("pane-drag", i)), egui::Sense::click_and_drag());
                             if resp.dragged() {
                                 self.panes[i].globe.drag(resp.drag_delta());
                             }
@@ -468,6 +472,7 @@ impl App {
                                 focus_sat.as_ref(),
                                 &focus_orbit,
                                 focus_pos,
+                                Some(now.timestamp_subsec_millis() as f64),
                             );
                         }
                         ViewKind::WorldMap => {
@@ -533,10 +538,12 @@ impl App {
 
 /// Invisible click hotspot in the pane's top-right corner to cycle views.
 /// Timezone quick-jump buttons drawn in the pane title bar (left of 3D/2D).
-/// Clicking rotates the globe so that region faces the viewer.
+/// Clicking rotates the globe so that region faces the viewer and follows it;
+/// clicking the SAME zone again releases the lock and eases back to the
+/// default view (the active zone is highlighted).
 fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut crate::ui::views::globe3d::GlobeState) -> bool {
     // ASCII labels (egui's default font has no CJK glyphs — CJK shows as tofu).
-    const ZONES: &[(&str, f64)] = &[("Beijing", 116.4), ("DC", -77.0)];
+    const ZONES: &[(&str, f64, f64)] = &[("Beijing", 116.4, 39.9), ("DC", -77.0, 38.9)];
     let mut jumped = false;
     let y = pane_rect.min.y + 2.0;
     let painter = ctx.layer_painter(egui::LayerId::new(
@@ -544,34 +551,50 @@ fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut cra
         egui::Id::new("tz-buttons-layer"),
     ));
     let mut x = pane_rect.max.x - 62.0 - 4.0;
-    for (label, lon) in ZONES.iter().rev() {
+    for (label, lon, lat) in ZONES.iter() {
         let w = 44.0;
         x -= w + 4.0;
         let rect = egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(w, 14.0));
         let mouse_in = ctx
             .input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
         let clicked = mouse_in && ctx.input(|i| i.pointer.any_click());
+        // The zone currently followed by the camera: highlighted so the
+        // locked state (and which zone it is) is visible in the title bar.
+        let active = globe.lock_label == Some(*label);
         painter.rect_filled(
             rect,
             3.0,
-            if mouse_in {
+            if active {
+                egui::Color32::from_rgb(180, 140, 50)
+            } else if mouse_in {
                 egui::Color32::from_rgb(70, 90, 130)
             } else {
                 egui::Color32::from_rgb(55, 58, 66)
             },
         );
+        if active {
+            painter.rect_stroke(
+                rect,
+                3.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 210, 80)),
+            );
+        }
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
             *label,
             egui::FontId::proportional(9.0),
-            egui::Color32::from_rgb(200, 205, 215),
+            if active {
+                egui::Color32::from_rgb(20, 20, 20)
+            } else {
+                egui::Color32::from_rgb(200, 205, 215)
+            },
         );
         if clicked {
-            // Face that longitude toward the viewer AND keep following it:
-            // set a "locked longitude" the globe tracks while auto-spinning.
-            globe.lock_lon = Some(*lon);
-            globe.last_interaction = Some(std::time::Instant::now());
+            // Same zone again → release the lock and ease back to the default
+            // view; a different zone → lock onto it. `toggle_zone` keeps the
+            // yaw continuous across the release (see `GlobeState::unlock`).
+            globe.toggle_zone(*label, *lon, *lat);
             jumped = true;
         }
     }

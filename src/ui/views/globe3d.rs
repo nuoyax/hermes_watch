@@ -22,39 +22,112 @@ pub struct GlobeState {
     /// When set, the camera tracks this Earth-fixed longitude: the location
     /// stays facing the viewer as the Earth turns underneath (real rotation).
     pub lock_lon: Option<f64>,
-    /// Effective yaw of the last rendered frame — lets a drag that releases
-    /// the follow-lock continue smoothly from where the camera actually was.
+    /// Latitude of the locked location (for the marker + pitch centering).
+    pub lock_lat: Option<f64>,
+    /// Display name of the locked location (drawn next to the marker).
+    pub lock_label: Option<&'static str>,
+    /// Effective yaw of the last rendered frame — lets a drag (or an unlock)
+    /// continue smoothly from where the camera actually was. Updated every
+    /// rendered frame, including while a follow-lock is active.
     pub current_yaw: f64,
     /// Last manual drag — 5 s of idleness after it triggers an auto-reset.
     pub last_drag: Option<std::time::Instant>,
+    /// Pitch the camera is easing toward (timezone jump centers on the
+    /// zone's latitude; unlocking eases back to `DEFAULT_PITCH`). `None`
+    /// once settled.
+    pub pitch_target: Option<f64>,
 }
 
 impl Default for GlobeState {
     fn default() -> Self {
         Self {
             yaw: 0.0,
-            pitch: 0.35,
+            pitch: Self::DEFAULT_PITCH,
             zoom: 100.0,
             last_interaction: None,
             lock_lon: None,
+            lock_lat: None,
+            lock_label: None,
             current_yaw: 0.0,
             last_drag: None,
+            pitch_target: None,
         }
     }
 }
 
 impl GlobeState {
+    /// Neutral camera tilt (radians) — the default view the pitch eases back
+    /// to when a follow-lock is released.
+    pub const DEFAULT_PITCH: f64 = 0.35;
+
+    /// Timezone quick-jump button: lock the camera onto `(lon, lat)` and ease
+    /// the pitch to that latitude. Clicking the SAME zone again toggles the
+    /// lock off and eases the pitch back to `DEFAULT_PITCH` — the yaw is left
+    /// alone so it continues from the current heading (see `unlock`).
+    ///
+    /// Returns `true` whenever the camera changed (either direction), so the
+    /// caller can treat it as "the view jumped".
+    pub fn toggle_zone(&mut self, label: &'static str, lon: f64, lat: f64) -> bool {
+        if self.lock_label == Some(label) {
+            self.unlock();
+        } else {
+            self.lock_lon = Some(lon);
+            self.lock_lat = Some(lat);
+            self.lock_label = Some(label);
+            self.pitch_target = Some(lat.to_radians());
+            // Keep `yaw` in sync with the locked heading so `current_yaw`
+            // starts accumulating from the right value this frame.
+            self.yaw = self.current_yaw;
+            self.last_interaction = Some(std::time::Instant::now());
+        }
+        true
+    }
+
+    /// Release the follow-lock (toggle-off or manual drag): ease the pitch
+    /// back to the default and keep the yaw exactly where the camera is
+    /// looking right now — `current_yaw` is refreshed on every rendered frame
+    /// (lock or not), so adopting it can never snap back to a stale heading.
+    pub fn unlock(&mut self) {
+        // While locked, `current_yaw` holds the yaw the last frame actually
+        // rendered (== `lon + gmst - 90°` for that frame). Adopting it as the
+        // free-camera yaw continues the exact same heading: the frame before
+        // and after the unlock render at the same angle, so nothing jumps.
+        self.yaw = self.current_yaw;
+        self.lock_lon = None;
+        self.lock_lat = None;
+        self.lock_label = None;
+        self.pitch_target = Some(Self::DEFAULT_PITCH);
+        self.last_interaction = Some(std::time::Instant::now());
+    }
+
+    /// Per-frame pitch easing toward `pitch_target` (exponential glide,
+    /// ~0.7 s at 60 fps). Cheap and stateless: the target lives in a field,
+    /// the step is a fixed fraction of the remaining distance.
+    fn settle_pitch(&mut self) {
+        let Some(target) = self.pitch_target else { return };
+        let k = 0.06_f64;
+        self.pitch += (target - self.pitch) * k;
+        if (target - self.pitch).abs() < 1e-3 {
+            self.pitch = target;
+            self.pitch_target = None; // settled — stop easing
+        }
+    }
+
     pub fn drag(&mut self, delta: Vec2) {
         self.yaw += delta.x as f64 * 0.01;
         self.pitch = (self.pitch + delta.y as f64 * 0.01).clamp(-1.5, 1.5);
         self.last_interaction = Some(std::time::Instant::now());
         self.last_drag = self.last_interaction;
+        self.pitch_target = None; // a drag cancels any pending pitch ease
         if self.lock_lon.is_some() {
             // Releasing the follow-lock: adopt the camera's actual heading so
-            // the view doesn't snap back to the stale manual yaw.
+            // the view doesn't snap back to the stale manual yaw. (The pitch
+            // is deliberately left where the drag put it.)
             self.yaw = self.current_yaw;
         }
         self.lock_lon = None; // manual drag releases the follow-lock
+        self.lock_lat = None;
+        self.lock_label = None;
     }
     pub fn zoom(&mut self, factor: f32) {
         self.zoom = (self.zoom * factor).clamp(40.0, 500.0);
@@ -80,17 +153,17 @@ impl GlobeState {
             .last_interaction
             .map(|t| now.duration_since(t).as_secs_f64())
             .unwrap_or(f64::INFINITY);
-        if idle < 3.0 {
-            // Hold still right after a drag — no drift.
-            return self.yaw;
-        }
-        // Free camera drifts gently back toward the sun-facing yaw.
-        sun_yaw
+        // Camera NEVER drifts or auto-resets on its own: a pane stays exactly
+        // where the user left it until they drag again. (The previous sun-
+        // tracking drift rotated every idle pane continuously, which read as
+        // panes "moving together".)
+        self.yaw
     }
 
     /// Auto-reset: 5 s after the last manual drag, ease the camera back to
     /// the default view (default pitch; follow-lock yaw if one is active,
     /// otherwise the neutral yaw the free camera had before the drag).
+    #[allow(dead_code)]
     pub fn auto_reset(&mut self, base_yaw: f64) {
         const IDLE_RESET: f64 = 5.0;
         let idle = self
@@ -98,6 +171,15 @@ impl GlobeState {
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(f64::INFINITY);
         if idle < IDLE_RESET {
+            return;
+        }
+        // Stay out of the way while a deliberate pitch ease is in flight
+        // (`settle_pitch`): a zone jump centres on the zone's latitude and an
+        // unlock eases to `DEFAULT_PITCH`. Both write `pitch` every frame, so
+        // easing toward `DEFAULT_PITCH` here too would fight them — with a
+        // fresh `GlobeState` (`last_drag == None`) the idle gate never trips,
+        // so a zone jump's latitude centring could never actually settle.
+        if self.pitch_target.is_some() {
             return;
         }
         if self.pitch != Self::default().pitch || self.yaw != base_yaw {
@@ -196,6 +278,7 @@ pub fn show_globe(
     sat: Option<&Sat>,
     orbit_eci: &[[f64; 3]],
     sat_pos: Option<GeoPoint>,
+    self_sim_hint: Option<f64>,
 ) {
     let center = rect.center();
     let r = cam.zoom;
@@ -210,9 +293,24 @@ pub fn show_globe(
     // A manual drag overrides it freely; auto-reset glides back to the sun.
     let sun_yaw = sun_dir_ef.0.atan2(sun_dir_ef.2) + earth_rot
         - std::f64::consts::FRAC_PI_2;
-    cam.auto_reset(sun_yaw);
+    // When the camera is follow-locked (e.g. a timezone jump), `auto_reset`
+    // must NOT ease `yaw` toward the sun-facing yaw — the lock's yaw is
+    // computed fresh in `effective_yaw` every frame, so easing toward
+    // `sun_yaw` fights the lock and the two yaws alternate between frames
+    // (that was the flickering lighting after "切到北京").
+    let locked = cam.lock_lon.is_some();
+    if !locked {
+        cam.auto_reset(sun_yaw);
+    }
+    // Pitch easing runs in BOTH states: a zone jump eases toward the zone's
+    // latitude, an unlock eases back to the default tilt.
+    cam.settle_pitch();
     let yaw = cam.effective_yaw(now, earth_rot, sun_yaw);
-    cam.current_yaw = yaw; // remember for a smooth release of the follow-lock
+    // ALWAYS record the yaw actually rendered this frame, lock or not:
+    // `current_yaw` means "the previous frame's rendered yaw", and freezing
+    // it while locked made the toggle-off (unlock) snap back to the heading
+    // the camera had at the moment the lock started.
+    cam.current_yaw = yaw;
     let pitch = cam.pitch;
 
     // Deep space + atmosphere limb. Painting is clipped to the pane rect so
@@ -239,7 +337,7 @@ pub fn show_globe(
     );
     let sun_norm = sun_world.dot(sun_world).sqrt();
     let tex = earth.texture(painter.ctx());
-    let (lat_bands, lon_bands) = (72usize, 144usize);
+    let (lat_bands, lon_bands) = (48usize, 96usize);
     // Rebuild the sphere mesh only when the camera/sun/earth-rotation actually
     // changed; otherwise replay the cached mesh. This keeps the CPU cost at
     // ~10.5k vertex evaluations per pane only on moving frames (drag, sim
@@ -253,12 +351,51 @@ pub fn show_globe(
         sun_dir_ef.2.to_bits(),
         earth_rot.to_bits(),
     );
+    // PER-PANE mesh cache, keyed by the pane's egui LayerId. A single shared
+    // slot made the 4 panes invalidate each other's cache every frame (each
+    // pane has its own camera pose), so pane A's rebuild forced pane B to
+    // replay a stale mesh with mismatched overlays — the persistent flicker.
+    // Keying by LayerId gives every pane its own independent cache.
     thread_local! {
-        static MESH_CACHE: std::cell::RefCell<Option<((u64, u64, u32, u64, u64, u64, u64), egui::Mesh)>> =
+        static MESH_CACHE: std::cell::RefCell<Option<std::collections::HashMap<egui::LayerId, ((u64, u64, u32, u64, u64, u64, u64), egui::Mesh, std::time::Instant, (f64, f64))>>> =
             const { std::cell::RefCell::new(None) };
     }
+    let mesh_layer = painter.layer_id();
+    let sim_seconds = self_sim_hint.unwrap_or(0.0);
+    let _ = sim_seconds;
+    let dragging = cam.last_interaction
+        .map(|t| now.duration_since(t).as_secs_f64() < 0.5)
+        .unwrap_or(false);
+    // Which yaw/pitch the CACHED mesh was built with. While a rebuild is
+    // throttled (replaying the stale mesh), everything else drawn this frame
+    // (orbit ring, satellite, marker) must use the SAME yaw/pitch — mixing a
+    // stale sphere with fresh overlays makes the terminator/geometry visibly
+    // jump between frames (the "闪" after the timezone jump).
+    let mut mesh_yaw = yaw;
+    let mut mesh_pitch = pitch;
     let mesh_changed = MESH_CACHE
-        .with(|c| c.borrow().as_ref().map_or(true, |(k, _)| *k != mesh_key));
+        .with(|c| {
+            let mut b = c.borrow_mut();
+            let m = b.get_or_insert_with(std::collections::HashMap::new);
+            match m.get(&mesh_layer) {
+                None => true,
+                Some((k, _, built, (cy, cpth))) => {
+                    mesh_yaw = *cy;
+                    mesh_pitch = *cpth;
+                    if *k != mesh_key {
+                        // Throttle rebuilds: the sim clock advances every frame
+                        // (earth_rot changes constantly), which would rebuild the
+                        // full 10.5k-vertex sphere every frame per pane and can
+                        // deadlock the AMD OpenGL driver under sustained load.
+                        // Rebuild at most every 100 ms — unless the user is
+                        // dragging, where latency matters.
+                        dragging || now.duration_since(*built).as_secs_f64() > 0.5
+                    } else {
+                        false
+                    }
+                }
+            }
+        });
     if mesh_changed {
         let mut vertices: Vec<egui::epaint::Vertex> = Vec::with_capacity((lat_bands + 1) * (lon_bands + 1));
         let mut indices: Vec<u32> = Vec::new();
@@ -309,12 +446,24 @@ pub fn show_globe(
             texture_id: tex.id(),
         };
         MESH_CACHE.with(|c| {
-            *c.borrow_mut() = Some((mesh_key, mesh.clone()));
+            let mut b = c.borrow_mut();
+            let m = b.get_or_insert_with(std::collections::HashMap::new);
+            m.insert(mesh_layer, (mesh_key, mesh.clone(), now, (yaw, pitch)));
+            // Safety cap (layout toggles can rotate layer ids): rebuild from
+            // scratch rather than grow unboundedly.
+            if m.len() > 16 {
+                m.clear();
+                m.insert(mesh_layer, (mesh_key, mesh.clone(), now, (yaw, pitch)));
+            }
         });
         painter.add(mesh);
     } else {
         MESH_CACHE.with(|c| {
-            if let Some((_, m)) = c.borrow().as_ref() {
+            if let Some((_, m, _, _)) = c
+                .borrow()
+                .as_ref()
+                .and_then(|map| map.get(&mesh_layer))
+            {
                 painter.add(m.clone());
             }
         });
@@ -322,6 +471,13 @@ pub fn show_globe(
 
     // Subtle atmosphere terminator glow on the night side edge.
     // (skip — the vertex shading handles it)
+
+    // While a mesh rebuild is throttled, the sphere on screen corresponds to
+    // the cached camera pose. Draw every overlay (orbit, satellite, marker)
+    // against THAT pose so the whole frame is internally consistent —
+    // otherwise the overlays lead the globe and the terminator flickers.
+    let render_yaw = if mesh_changed { yaw } else { mesh_yaw };
+    let render_pitch = if mesh_changed { pitch } else { mesh_pitch };
 
     let Some(sat) = sat else { return };
     let color = sat.group.color();
@@ -352,7 +508,7 @@ pub fn show_globe(
         // Modest exaggeration: hugs the globe visually while LEO orbits still
         // clear the surface (displayed km values stay true).
         let alt_r = (r as f64) * (1.0 + alt / 6371.0 * 0.4);
-        let cam_v = rotate_to_cam(v, alt_r, yaw, pitch);
+        let cam_v = rotate_to_cam(v, alt_r, render_yaw, render_pitch);
         let cur = project(cam_v, center);
         // Occlusion: a point is hidden when it's on the far side (z < 0) AND
         // its projection lands inside the globe disc.
@@ -395,7 +551,7 @@ pub fn show_globe(
             (p.lon_deg + earth_rot.to_degrees()).to_radians(),
         );
         let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
-        let cam_v = rotate_to_cam(n, alt_r, yaw, pitch);
+        let cam_v = rotate_to_cam(n, alt_r, render_yaw, render_pitch);
         let (sp, z) = project(cam_v, center);
         let behind = z < 0.0 && sp.distance(center) < r;
         if !behind {
@@ -406,8 +562,8 @@ pub fn show_globe(
                 sat,
                 color,
                 scale as f32,
-                yaw,
-                pitch,
+                render_yaw,
+                render_pitch,
                 now.elapsed().as_secs_f32(),
                 sun_world,
             );
@@ -417,6 +573,36 @@ pub fn show_globe(
                 format!("{} · {} km", sat.name, p.alt_km as i32),
                 egui::FontId::proportional((11.0 * scale as f32).max(9.0)),
                 Color32::WHITE,
+            );
+        }
+    }
+
+    // Locked-location marker (timezone jump): a crosshair + label so the
+    // viewer can see exactly where the locked point is on the globe.
+    if let (Some(lon), Some(lat), Some(label)) = (cam.lock_lon, cam.lock_lat, cam.lock_label) {
+        let (la_r, lo_r) = (lat.to_radians(), (lon + earth_rot.to_degrees()).to_radians());
+        let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+        let cam_v = rotate_to_cam(n, r as f64 * 1.002, render_yaw, render_pitch);
+        let (mp, z) = project(cam_v, center);
+        let behind = z < 0.0 && mp.distance(center) < r;
+        if !behind {
+            let cross = 6.0 * scale as f32;
+            let col = Color32::from_rgb(255, 210, 80);
+            painter.line_segment(
+                [mp - Vec2::new(cross, 0.0), mp + Vec2::new(cross, 0.0)],
+                Stroke::new(1.5, col),
+            );
+            painter.line_segment(
+                [mp - Vec2::new(0.0, cross), mp + Vec2::new(0.0, cross)],
+                Stroke::new(1.5, col),
+            );
+            painter.circle_stroke(mp, 9.0 * scale as f32, Stroke::new(1.2, col));
+            painter.text(
+                mp + Vec2::new(12.0 * scale as f32, 0.0),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional((10.0 * scale as f32).max(9.0)),
+                col,
             );
         }
     }
@@ -439,9 +625,6 @@ fn draw_spacecraft(
     t: f32,
     sun_world: V3,
 ) {
-    // Soft glow behind the model.
-    painter.circle_filled(sp, 14.0 * scale, blend(color, 0.25));
-
     let upper = sat.name.to_uppercase();
     if upper.contains("ISS")
         || upper.contains("ZARYA")
@@ -634,10 +817,13 @@ fn draw_iss_model(
             0.18 + 0.10 * facing
         };
         let shade = shade as f32;
+        // Whitewash: mix the baked color toward white so the module/panel
+        // geometry stays readable even on the night side.
+        let mix = 0.40_f32;
         let col = Color32::from_rgb(
-            (base[0] as f32 * shade) as u8,
-            (base[1] as f32 * shade) as u8,
-            (base[2] as f32 * shade) as u8,
+            (base[0] as f32 * shade * (1.0 - mix) + 255.0 * mix * shade) as u8,
+            (base[1] as f32 * shade * (1.0 - mix) + 255.0 * mix * shade) as u8,
+            (base[2] as f32 * shade * (1.0 - mix) + 255.0 * mix * shade) as u8,
         );
         let base_vi = mesh.vertices.len() as u32;
         for &i in idx.iter() {

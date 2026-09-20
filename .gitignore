@@ -5,3 +5,9 @@ CLAUDE.md
 .claudeignore
 memory/
 *.log
+
+# Model-debug / screenshot intermediates (regenerable, not shipped assets)
+assets/s1.json
+assets/sc.json
+assets/t.json
+docs/shot.png
