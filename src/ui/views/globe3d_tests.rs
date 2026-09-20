@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use super::super::globe3d::{earth_rotation, sun_direction, GlobeState, V3};
+    use super::super::globe3d::{
+        earth_fixed_to_world_test_hook as earth_fixed_to_world, earth_rotation, sun_direction,
+        GlobeState, V3,
+    };
     use crate::orbit::gmst_deg;
     use crate::ui::views::globe3d::rotate_to_cam_test_hook as rotate_to_cam;
     use chrono::{TimeZone, Utc};
@@ -91,21 +94,77 @@ mod tests {
         assert!(d > 0.99, "dot={d}");
     }
 
-    /// Consistency: the mesh normal at the subsolar longitude (after +GMST)
-    /// must align with the sun after the same +GMST rotation.
+    /// Consistency: the mesh normal at the subsolar point, constructed EXACTLY
+    /// as `show_globe` builds its vertex normals (`lo_r = lon + gmst`), must
+    /// align with the lighting vector produced by `earth_fixed_to_world` — the
+    /// same function, and therefore the same +GMST map, that `show_globe` uses
+    /// for `sun_world`.
+    ///
+    /// Anchoring BOTH sides to the production map is the point: the earlier
+    /// version of this test applied a self-consistent helper rotation to both
+    /// operands, so it was an identity that held under EITHER sign of the
+    /// rotation and could never detect the TASK-018 frame mismatch. Verified
+    /// by reverse testing — restoring the old `−GMST` sign makes this red.
     #[test]
     fn lighting_frame_consistent() {
         let t = Utc.with_ymd_and_hms(2026, 9, 17, 6, 0, 0).unwrap();
         let sun_ef = sun_direction(t);
         let gmst = earth_rotation(t);
-        // Subsolar lon in Earth-fixed frame:
-        let sub_lon: f64 = (180.0_f64 - 6.0 * 15.0).to_radians(); // 90°E
-        // Apply the mesh's +gmst to both, then compare directly.
-        let rot = |v: V3, a: f64| V3(v.0 * a.cos() + v.2 * a.sin(), v.1, -v.0 * a.sin() + v.2 * a.cos());
-        let n = rot(V3((sub_lon).cos(), 0.0, (sub_lon).sin()), gmst);
-        let s = rot(sun_ef, gmst);
+        // Subsolar lon in the Earth-fixed frame: 90°E at 06:00 UTC.
+        let sub_lon = 90.0_f64.to_radians();
+        // Mesh normal, built the way `show_globe` builds it: world lon = lon + gmst.
+        let la_r = sun_ef.1.asin();
+        let lo_r = sub_lon + gmst;
+        let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+        // Lighting vector via the production map.
+        let s = earth_fixed_to_world(sun_ef, gmst);
         let d = n.0 * s.0 + n.1 * s.1 + n.2 * s.2;
         assert!(d > 0.999, "dot={d}");
+    }
+
+    /// TASK-018 regression: at the TRUE subsolar point the mesh normal must be
+    /// fully lit. The frame mismatch was invisible to any test that reused one
+    /// rotation for both operands, so this one deliberately constructs the
+    /// normal from the mesh's own formula — `lo_r = (lon + gmst)` — and the
+    /// lighting vector from the production `earth_fixed_to_world`.
+    ///
+    /// The offset between the two frames is `2·GMST`, so it ranges over a
+    /// whole revolution within a day: a single sample can be near-aligned by
+    /// coincidence (at 00:00Z on the fixture date the wrong sign is only 8.1°
+    /// off). Sweeping the clock is therefore part of the test — the WORST
+    /// instant in the day (`2·GMST ≡ 180°`, ~06:15Z here) is what a real
+    /// terminator shows, and the bug turns it into a ≈ −1 dot product.
+    #[test]
+    fn subsolar_normal_aligned_with_sun_world() {
+        let mut worst = (f64::MAX, 0u32);
+        for hour in 0..24 {
+            let t = Utc.with_ymd_and_hms(2026, 9, 17, hour, 0, 0).unwrap();
+            let sun_ef = sun_direction(t);
+            let gmst = earth_rotation(t);
+
+            // The true subsolar point, recovered from the Earth-fixed sun
+            // vector: latitude = declination, longitude = atan2(z, x).
+            let decl = sun_ef.1.asin();
+            let subsolar_lon = sun_ef.2.atan2(sun_ef.0);
+
+            // Mesh normal at that point, using `show_globe`'s construction:
+            // `lo_r = (lon + gmst).to_radians()`.
+            let (la_r, lo_r) = (decl, subsolar_lon + gmst);
+            let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+
+            // Lighting vector via the production +GMST map (same as show_globe).
+            let s = earth_fixed_to_world(sun_ef, gmst);
+            let d = n.0 * s.0 + n.1 * s.1 + n.2 * s.2;
+            if d < worst.0 {
+                worst = (d, hour);
+            }
+        }
+        let (d, hour) = worst;
+        assert!(
+            d > 0.999,
+            "subsolar point not lit at {hour:02}:00Z: worst dot={d} (angle {:.3}°)",
+            d.clamp(-1.0, 1.0).acos().to_degrees()
+        );
     }
 
     /// Clicking the SAME timezone button again must release the lock and hand

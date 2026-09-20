@@ -303,6 +303,25 @@ pub fn rotate_to_cam_test_hook(v: V3, r: f64, yaw: f64, pitch: f64) -> V3 {
     rotate_to_cam(v, r, yaw, pitch)
 }
 
+/// Rotate an Earth-fixed vector into the world frame (+GMST about the polar
+/// axis). Shared by `show_globe`'s lighting and pinned by
+/// `lighting_frame_consistent`: both callers must use THIS one map, so a
+/// lighting/frame mismatch is forced through a single choke point instead of
+/// being masked by a self-consistent copy in the tests.
+#[cfg(test)]
+pub fn earth_fixed_to_world_test_hook(v: V3, earth_rot: f64) -> V3 {
+    earth_fixed_to_world(v, earth_rot)
+}
+
+/// Rotate an Earth-fixed vector into the world frame: `+GMST` about the
+/// polar axis, (x, y, z) -> (x·cos g − z·sin g, y, x·sin g + z·cos g). A
+/// surface normal at Earth-fixed longitude λ thus lands at world longitude
+/// λ + GMST, matching the mesh's `lon + gdeg` normals. See `sun_direction`.
+fn earth_fixed_to_world(v: V3, earth_rot: f64) -> V3 {
+    let (sg, cg) = earth_rot.sin_cos();
+    V3(v.0 * cg - v.2 * sg, v.1, v.0 * sg + v.2 * cg)
+}
+
 /// Render the textured rotating Earth + focused satellite.
 #[allow(clippy::too_many_arguments)]
 pub fn show_globe(
@@ -369,13 +388,14 @@ pub fn show_globe(
     // from): rotate the earth-fixed sun vector by GMST into the world frame
     // (same Y-axis rotation the mesh normals use). Dragging the globe
     // rotates the lit hemisphere together with the Earth, instantly.
+    // Earth-fixed -> world is a +GMST rotation about the polar axis:
+    // (x, y, z) -> (x·cos g − z·sin g, y, x·sin g + z·cos g). For the
+    // subsolar vector (cosδ·cosλ, sinδ, cosδ·sinλ) this maps the Earth-fixed
+    // longitude λ to the world longitude λ + g — exactly the `lon + gdeg` the
+    // mesh vertex normals use below. The pre-TASK-018 form used the opposite
+    // sign (−GMST), putting the lighting 2·GMST away from the geometry.
     let g = earth_rot;
-    let (sg, cg) = g.sin_cos();
-    let sun_world = V3(
-        sun_dir_ef.0 * cg + sun_dir_ef.2 * sg,
-        sun_dir_ef.1,
-        -sun_dir_ef.0 * sg + sun_dir_ef.2 * cg,
-    );
+    let sun_world = earth_fixed_to_world(sun_dir_ef, g);
     let sun_norm = sun_world.dot(sun_world).sqrt();
     let tex = earth.texture(painter.ctx());
     let (lat_bands, lon_bands) = (GLOBE_LAT_BANDS, GLOBE_LON_BANDS);
@@ -1003,9 +1023,19 @@ fn blend(c: Color32, alpha: f32) -> Color32 {
 }
 
 /// Sun direction in the EARTH-FIXED frame (unit vector) at `time`: points
-/// from Earth's center toward the subsolar point. Lighting is done entirely
-/// in this frame (normals without the GMST term), so the day/night pattern
-/// is fixed to the geography and can never shift when the user drags.
+/// from Earth's center toward the subsolar point (longitude = the current
+/// local-noon meridian, latitude = solar declination).
+///
+/// Frame relationship: `show_globe` works in the WORLD (inertial) frame. The
+/// mesh vertex normals carry the GMST term (`lon + gdeg`), i.e. they are the
+/// Earth-fixed normals rotated by +GMST; the texture is Earth-fixed and the
+/// camera yaw supplies the spin. This function's vector is likewise +GMST-
+/// rotated into that world frame before the shading dot product (see
+/// `sun_world` in `show_globe`) — the lighting is therefore NOT done in the
+/// Earth-fixed frame, and an Earth-fixed normals-only dot product here would
+/// be a frame mismatch. Because both sides share the same +GMST map, the
+/// day/night terminator stays glued to the geography (and to the camera) and
+/// cannot shift when the user drags.
 pub fn sun_direction(time: DateTime<Utc>) -> V3 {
     // Subsolar point: latitude = solar declination, longitude = where local
     // solar noon is right now (UTC hour angle).
