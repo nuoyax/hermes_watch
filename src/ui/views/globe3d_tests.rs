@@ -14,6 +14,7 @@ mod tests {
             zoom: 100.0,
             last_interaction: None,
             lock_lon: Some(116.4), // Beijing
+            ..Default::default()
         };
         let gmst = 152.0_f64.to_radians();
         let yaw = cam.effective_yaw_for_test(std::time::Instant::now(), gmst);
