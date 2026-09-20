@@ -8,6 +8,33 @@ use crate::orbit::GeoPoint;
 use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 
+/// Sphere tessellation, in latitude bands × longitude bands (vertices per
+/// frame ≈ (lat+1)·(lon+1) ≈ 4.8k, → ~9.4k triangles). Trade-off: more bands
+/// smooth the silhouette but every rebuild (drag / sim clock) walks the whole
+/// grid, so this stays well below what a 4-pane 60 fps layout can afford.
+const GLOBE_LAT_BANDS: usize = 48;
+const GLOBE_LON_BANDS: usize = 96;
+
+/// A pane counts as "the user is dragging" for this long (s) after the last
+/// pointer interaction. Deliberately separate from the mesh rebuild throttle
+/// below even though both happen to be 0.5 s: this one is gesture state
+/// (latency matters), the other is a render budget.
+const DRAG_ACTIVE_SECS: f64 = 0.5;
+
+/// Minimum wall-clock gap between full sphere-mesh rebuilds. The sim clock
+/// advances every frame (`earth_rot` changes constantly), so without this the
+/// 10.5k-vertex sphere would be re-evaluated every frame in every pane — 4
+/// panes at ~60 fps sustained is enough to hang the AMD OpenGL driver. Kept at
+/// 0.5 s (2 Hz) rather than the 100 ms an earlier comment implied: 4 panes
+/// rebuilding at 10 Hz was judged too risky for that driver. A drag bypasses
+/// the throttle (see `dragging`) because gesture latency matters more there.
+const MESH_REBUILD_INTERVAL_SECS: f64 = 0.5;
+
+/// ISS whitewash: fraction of the baked material colour mixed toward white.
+/// Trade-off between night-side readability (module/panel geometry stays
+/// visible against the dark limb) and colour fidelity of the real model.
+const ISS_NIGHT_WHITEWASH: f32 = 0.40;
+
 /// Per-pane camera state.
 #[derive(Debug, Clone, Copy)]
 pub struct GlobeState {
@@ -59,6 +86,13 @@ impl GlobeState {
     /// Neutral camera tilt (radians) — the default view the pitch eases back
     /// to when a follow-lock is released.
     pub const DEFAULT_PITCH: f64 = 0.35;
+
+    /// Zoom (globe radius in px) limits for the scroll wheel. The lower bound
+    /// keeps the sphere large enough that the ISS model and its label stay
+    /// legible; the upper bound keeps a zoomed-in pane from pushing the orbit
+    /// ring and panes' overlays far outside the clip rect at 4 panes.
+    pub const ZOOM_MIN: f32 = 40.0;
+    pub const ZOOM_MAX: f32 = 500.0;
 
     /// Timezone quick-jump button: lock the camera onto `(lon, lat)` and ease
     /// the pitch to that latitude. Clicking the SAME zone again toggles the
@@ -130,17 +164,17 @@ impl GlobeState {
         self.lock_label = None;
     }
     pub fn zoom(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(40.0, 500.0);
+        self.zoom = (self.zoom * factor).clamp(Self::ZOOM_MIN, Self::ZOOM_MAX);
         self.last_interaction = Some(std::time::Instant::now());
     }
     /// Camera yaw: either locked onto `lock_lon` (region faces the viewer,
-    /// drifting with the real Earth rotation) or free (user yaw), paused 3 s
-    /// after interaction.
+    /// drifting with the real Earth rotation) or free (the user's yaw,
+    /// untouched until the user drags — see `auto_reset`).
     #[cfg(test)]
-    pub(crate) fn effective_yaw_for_test(&self, now: std::time::Instant, gmst: f64) -> f64 {
-        self.effective_yaw(now, gmst, 0.0)
+    pub(crate) fn effective_yaw_for_test(&self, gmst: f64) -> f64 {
+        self.effective_yaw(gmst)
     }
-    fn effective_yaw(&self, now: std::time::Instant, gmst: f64, sun_yaw: f64) -> f64 {
+    fn effective_yaw(&self, gmst: f64) -> f64 {
         if let Some(lon) = self.lock_lon {
             // Mesh places Earth-fixed lon L at world longitude (L + gmst).
             // rotate_to_cam maps world lon W to camera angle (W - yaw); the
@@ -149,21 +183,22 @@ impl GlobeState {
             let lon_rot = lon.to_radians() + gmst;
             return lon_rot - std::f64::consts::FRAC_PI_2;
         }
-        let idle = self
-            .last_interaction
-            .map(|t| now.duration_since(t).as_secs_f64())
-            .unwrap_or(f64::INFINITY);
-        // Camera NEVER drifts or auto-resets on its own: a pane stays exactly
-        // where the user left it until they drag again. (The previous sun-
-        // tracking drift rotated every idle pane continuously, which read as
-        // panes "moving together".)
+        // With no follow-lock the camera yaw is simply the user's yaw: an
+        // interactive drag moves it and nothing else does, so an untouched
+        // pane holds its heading forever. A pane only ever eases back toward
+        // the sun-facing view via `auto_reset`, which requires a previous
+        // *manual drag* (see there) — never on its own.
         self.yaw
     }
 
-    /// Auto-reset: 5 s after the last manual drag, ease the camera back to
-    /// the default view (default pitch; follow-lock yaw if one is active,
-    /// otherwise the neutral yaw the free camera had before the drag).
-    #[allow(dead_code)]
+    /// Auto-reset: eases the camera back to the sun-facing default view, but
+    /// only after the user actually *dragged* and then stopped — and only on
+    /// panes that are not follow-locked. `last_drag` tracks pointer drags
+    /// exclusively (`toggle_zone` / `unlock` touch `last_interaction`, not
+    /// this), so a pane that was never touched starts at `last_drag == None`
+    /// and its idle gate never trips: it holds the user's heading exactly (see
+    /// `effective_yaw`). Once a drag happened, 5 s of idleness glides yaw/pitch
+    /// back to the sun-facing view (or the active lock's yaw).
     pub fn auto_reset(&mut self, base_yaw: f64) {
         const IDLE_RESET: f64 = 5.0;
         let idle = self
@@ -278,7 +313,6 @@ pub fn show_globe(
     sat: Option<&Sat>,
     orbit_eci: &[[f64; 3]],
     sat_pos: Option<GeoPoint>,
-    self_sim_hint: Option<f64>,
 ) {
     let center = rect.center();
     let r = cam.zoom;
@@ -305,7 +339,7 @@ pub fn show_globe(
     // Pitch easing runs in BOTH states: a zone jump eases toward the zone's
     // latitude, an unlock eases back to the default tilt.
     cam.settle_pitch();
-    let yaw = cam.effective_yaw(now, earth_rot, sun_yaw);
+    let yaw = cam.effective_yaw(earth_rot);
     // ALWAYS record the yaw actually rendered this frame, lock or not:
     // `current_yaw` means "the previous frame's rendered yaw", and freezing
     // it while locked made the toggle-off (unlock) snap back to the heading
@@ -337,7 +371,7 @@ pub fn show_globe(
     );
     let sun_norm = sun_world.dot(sun_world).sqrt();
     let tex = earth.texture(painter.ctx());
-    let (lat_bands, lon_bands) = (48usize, 96usize);
+    let (lat_bands, lon_bands) = (GLOBE_LAT_BANDS, GLOBE_LON_BANDS);
     // Rebuild the sphere mesh only when the camera/sun/earth-rotation actually
     // changed; otherwise replay the cached mesh. This keeps the CPU cost at
     // ~10.5k vertex evaluations per pane only on moving frames (drag, sim
@@ -361,10 +395,8 @@ pub fn show_globe(
             const { std::cell::RefCell::new(None) };
     }
     let mesh_layer = painter.layer_id();
-    let sim_seconds = self_sim_hint.unwrap_or(0.0);
-    let _ = sim_seconds;
     let dragging = cam.last_interaction
-        .map(|t| now.duration_since(t).as_secs_f64() < 0.5)
+        .map(|t| now.duration_since(t).as_secs_f64() < DRAG_ACTIVE_SECS)
         .unwrap_or(false);
     // Which yaw/pitch the CACHED mesh was built with. While a rebuild is
     // throttled (replaying the stale mesh), everything else drawn this frame
@@ -387,9 +419,11 @@ pub fn show_globe(
                         // (earth_rot changes constantly), which would rebuild the
                         // full 10.5k-vertex sphere every frame per pane and can
                         // deadlock the AMD OpenGL driver under sustained load.
-                        // Rebuild at most every 100 ms — unless the user is
-                        // dragging, where latency matters.
-                        dragging || now.duration_since(*built).as_secs_f64() > 0.5
+                        // Rebuild at most once per `MESH_REBUILD_INTERVAL_SECS` —
+                        // unless the user is dragging, where latency matters.
+                        dragging
+                            || now.duration_since(*built).as_secs_f64()
+                                > MESH_REBUILD_INTERVAL_SECS
                     } else {
                         false
                     }
@@ -498,7 +532,6 @@ pub fn show_globe(
         // world (inertial) longitude = atan2(y, x). Map: n = (x/rr, z/rr, y/rr).
         V3(x / rr, z / rr, y / rr)
     };
-    let mut prev: Option<(Pos2, bool)> = None;
     // Collect consecutive visible points into runs, then draw each run as a
     // single smooth polyline (one shape = uniform joints, no dotted look).
     let mut runs: Vec<Vec<Pos2>> = Vec::new();
@@ -514,16 +547,15 @@ pub fn show_globe(
         // its projection lands inside the globe disc.
         let visible = cur.1 > 0.0 || cur.0.distance(center) > r;
         if visible {
+            // Continue the run in progress, or start one on the first point.
             match runs.last_mut() {
-                Some(run) if prev.is_some() => run.push(cur.0),
-                _ => runs.push(vec![cur.0]),
+                Some(run) => run.push(cur.0),
+                None => runs.push(vec![cur.0]),
             }
         } else {
             runs.push(Vec::new()); // break the polyline at the globe's edge
         }
-        prev = Some((cur.0, visible));
     }
-    let _ = prev;
     // Glow pass for depth, then a crisp core line. Widths scale with zoom but
     // never fall below ~1 px, so dense points join into a smooth curve
     // instead of reading as separate dots.
@@ -819,7 +851,7 @@ fn draw_iss_model(
         let shade = shade as f32;
         // Whitewash: mix the baked color toward white so the module/panel
         // geometry stays readable even on the night side.
-        let mix = 0.40_f32;
+        let mix = ISS_NIGHT_WHITEWASH;
         let col = Color32::from_rgb(
             (base[0] as f32 * shade * (1.0 - mix) + 255.0 * mix * shade) as u8,
             (base[1] as f32 * shade * (1.0 - mix) + 255.0 * mix * shade) as u8,

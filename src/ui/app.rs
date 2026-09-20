@@ -154,8 +154,6 @@ impl eframe::App for App {
 
         // Advance the simulation clock (accelerated time-lapse so Earth
         // rotation and satellite motion are visible at a glance).
-        let now_sim = frame_start.elapsed();
-        let _ = now_sim;
         let elapsed = self.sim_last_frame.elapsed().as_secs_f64().min(0.1);
         self.sim_last_frame = frame_start;
         self.sim_time += chrono::Duration::milliseconds((elapsed * self.speed * 1000.0) as i64);
@@ -422,9 +420,10 @@ impl App {
 
                     let mut child = panes::pane_ui_at(ui, content);
                     // View lock buttons in the pane's title bar (jump globe to a
-                    // timezone's longitude).
-                    let tz_jumped = title_bar_buttons(ctx, pixels, &mut self.panes[i].globe);
-                    let _ = tz_jumped;
+                    // timezone's longitude). No return value: the frame is
+                    // repainted unconditionally (`request_repaint_after` in
+                    // `update`), so a jump needs no extra repaint trigger.
+                    title_bar_buttons(ctx, pixels, &mut self.panes[i].globe);
                     match pane.view {
                         ViewKind::Globe3D => {
                             // Interaction: drag to rotate, scroll to zoom.
@@ -472,7 +471,6 @@ impl App {
                                 focus_sat.as_ref(),
                                 &focus_orbit,
                                 focus_pos,
-                                Some(now.timestamp_subsec_millis() as f64),
                             );
                         }
                         ViewKind::WorldMap => {
@@ -536,15 +534,18 @@ impl App {
     }
 }
 
-/// Invisible click hotspot in the pane's top-right corner to cycle views.
 /// Timezone quick-jump buttons drawn in the pane title bar (left of 3D/2D).
 /// Clicking rotates the globe so that region faces the viewer and follows it;
 /// clicking the SAME zone again releases the lock and eases back to the
-/// default view (the active zone is highlighted).
-fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut crate::ui::views::globe3d::GlobeState) -> bool {
+/// default view (the active zone is highlighted). The active zone is read back
+/// from `globe.lock_label`, so the button state needs no extra channel.
+fn title_bar_buttons(
+    ctx: &egui::Context,
+    pane_rect: egui::Rect,
+    globe: &mut crate::ui::views::globe3d::GlobeState,
+) {
     // ASCII labels (egui's default font has no CJK glyphs — CJK shows as tofu).
     const ZONES: &[(&str, f64, f64)] = &[("Beijing", 116.4, 39.9), ("DC", -77.0, 38.9)];
-    let mut jumped = false;
     let y = pane_rect.min.y + 2.0;
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
@@ -595,22 +596,26 @@ fn title_bar_buttons(ctx: &egui::Context, pane_rect: egui::Rect, globe: &mut cra
             // view; a different zone → lock onto it. `toggle_zone` keeps the
             // yaw continuous across the release (see `GlobeState::unlock`).
             globe.toggle_zone(*label, *lon, *lat);
-            jumped = true;
         }
     }
-    jumped
 }
 
 /// 3D/2D toggle buttons in the pane's top-right title bar.
 fn view_toggle(ctx: &egui::Context, pane_rect: egui::Rect, current: ViewKind) -> Option<ViewKind> {    let y = pane_rect.min.y + 2.0;
-    let btn = |x: f32, label: &'static str, target: ViewKind| -> (egui::Rect, bool, bool) {
-        let rect = egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(28.0, 14.0));
-        let mouse_in = ctx
-            .input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
-        let clicked = mouse_in && ctx.input(|i| i.pointer.any_click());
-        let active = current == target;
-        (rect, active, clicked)
-    };
+    // Returns (rect, active, clicked, label). The label travels through here so
+    // the drawing loop below paints each button's own text — the earlier
+    // `std::ptr::eq(&rect, &b3.0)` test compared the *copy* yielded by the
+    // array `for` loop against the original tuple, which is never equal, so both
+    // buttons drew "2D".
+    let btn =
+        |x: f32, label: &'static str, target: ViewKind| -> (egui::Rect, bool, bool, &'static str) {
+            let rect = egui::Rect::from_min_size(egui::Pos2::new(x, y), egui::Vec2::new(28.0, 14.0));
+            let mouse_in = ctx
+                .input(|i| i.pointer.latest_pos().is_some_and(|p| rect.contains(p)));
+            let clicked = mouse_in && ctx.input(|i| i.pointer.any_click());
+            let active = current == target;
+            (rect, active, clicked, label)
+        };
 
     let b3 = btn(pane_rect.max.x - 62.0, "3D", ViewKind::Globe3D);
     let b2 = btn(pane_rect.max.x - 32.0, "2D", ViewKind::WorldMap);
@@ -619,7 +624,7 @@ fn view_toggle(ctx: &egui::Context, pane_rect: egui::Rect, current: ViewKind) ->
         egui::Order::Foreground,
         egui::Id::new("view-toggle-layer"),
     ));
-    for (rect, active, _) in [b3, b2] {
+    for (rect, active, _, label) in [b3, b2] {
         painter.rect_filled(
             rect,
             3.0,
@@ -632,7 +637,7 @@ fn view_toggle(ctx: &egui::Context, pane_rect: egui::Rect, current: ViewKind) ->
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
-            if std::ptr::eq(&rect, &b3.0) { "3D" } else { "2D" },
+            label,
             egui::FontId::proportional(10.0),
             if active { egui::Color32::WHITE } else { egui::Color32::from_rgb(160, 160, 170) },
         );

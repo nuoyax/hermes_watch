@@ -17,7 +17,7 @@ mod tests {
             ..Default::default()
         };
         let gmst = 152.0_f64.to_radians();
-        let yaw = cam.effective_yaw_for_test(std::time::Instant::now(), gmst);
+        let yaw = cam.effective_yaw_for_test(gmst);
 
         // Beijing's surface normal at world angle (lon + gmst).
         let (lat, lon) = (39.9_f64.to_radians(), (116.4_f64 + gmst.to_degrees()).to_radians());
@@ -68,7 +68,7 @@ mod tests {
 
         // One rendered frame while locked: `show_globe` refreshes
         // `current_yaw` from the yaw it actually drew.
-        let rendered_before = cam.effective_yaw_for_test(std::time::Instant::now(), gmst);
+        let rendered_before = cam.effective_yaw_for_test(gmst);
         cam.current_yaw = rendered_before;
 
         cam.toggle_zone("Beijing", 116.4, 39.9); // toggle off
@@ -77,7 +77,7 @@ mod tests {
         assert_eq!(cam.pitch_target, Some(GlobeState::DEFAULT_PITCH));
 
         // The next frame renders at the same heading it did while locked.
-        let rendered_after = cam.effective_yaw_for_test(std::time::Instant::now(), gmst);
+        let rendered_after = cam.effective_yaw_for_test(gmst);
         assert!(
             (rendered_after - rendered_before).abs() < 1e-9,
             "yaw jumped on unlock: {rendered_before} -> {rendered_after}"
