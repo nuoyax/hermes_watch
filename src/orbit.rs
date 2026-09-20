@@ -171,24 +171,46 @@ fn wrap_degrees(d: f64) -> f64 {
     d
 }
 
-/// Approximate Greenwich Mean Sidereal Time in degrees at `time`.
-fn gmst_deg(time: DateTime<Utc>) -> f64 {
-    // Julian date at 0h UT then fraction (IAU 1982 simplified).
-    let (y, m, d) = (time.year(), time.month(), time.day());
-    let day = NaiveDate::from_ymd_opt(y, m as u32, d as u32).unwrap_or_default();
-    let jd0 = julian_day(day.num_days_from_ce()) - 0.5;
-    let jd = jd0 + time.hour() as f64 / 24.0 + time.minute() as f64 / 1440.0
-        + time.second() as f64 / 86400.0;
-    let t = (jd - 2_451_545.0) / 36_525.0;
-    let gmst = 280.46061837 + 36_079.8750114 * t + 0.000_387_933 * t * t;
-    let mut g = gmst % 360.0;
-    if g < 0.0 {
-        g += 360.0;
-    }
-    g
+/// Greenwich Mean Sidereal Time in degrees at `time` — the SINGLE SOURCE OF
+/// TRUTH for the Earth's spin phase.
+///
+/// This used to be duplicated here and in `ui/views/globe3d.rs`, and both
+/// copies carried the same rate bug (a per-century coefficient applied to a
+/// per-day quantity → 0.9878°/day instead of 360.9856°/day). One definition,
+/// unit-tested against a standard value, is the fix that cannot silently
+/// regress in only one of the two call sites. `globe3d::earth_rotation` now
+/// delegates here (its former private `gmst_deg` copy is gone).
+pub fn gmst_deg(time: DateTime<Utc>) -> f64 {
+    // Standard IAU 1982 GMST (Meeus ch. 12), evaluated straight from
+    // `d = JD − J2000` in DAYS. The sidereal rate is 360.98564736629°/day —
+    // not per century — so the linear term must use `d`, not `d / 36525`.
+    let d = julian_date(time) - 2_451_545.0;
+    let t = d / 36_525.0; // Julian centuries (only the tiny T² term wants it).
+    let gmst = 280.46061837 + 360.985_647_366_29 * d + 0.000_387_933 * t * t;
+    gmst.rem_euclid(360.0)
 }
 
-/// Julian Day from days-since-CE (chrono proleptic Gregorian).
+/// Julian Date (UT) at `time`, including the time-of-day fraction.
+fn julian_date(time: DateTime<Utc>) -> f64 {
+    let day = NaiveDate::from_ymd_opt(time.year(), time.month(), time.day())
+        .expect("time is always a real date");
+    // `julian_day` is already the JD at 00:00 UT of this civil date, so the
+    // fractional day is added directly — no extra ±0.5 here. (The two old
+    // copies each added one anyway, in opposite directions, putting the Earth
+    // a half-day's spin away from the truth; see `julian_day`.)
+    julian_day(day.num_days_from_ce())
+        + time.hour() as f64 / 24.0
+        + time.minute() as f64 / 1_440.0
+        + time.second() as f64 / 86_400.0
+}
+
+/// Julian Day at 00:00 UT of the civil date `days_from_ce` days after CE.
+///
+/// Verified: `num_days_from_ce(1970-01-01) == 719163` and
+/// `num_days_from_ce(2026-09-17) == 739876`, giving JD 2440587.5 and
+/// 2461300.5 — i.e. this function already lands on the 0h-UT epoch, so the
+/// callers must NOT add another `- 0.5` (a pair of them used to cancel here
+/// and to displace `globe3d` by a full spin half-day respectively).
 fn julian_day(days_from_ce: i32) -> f64 {
     // CE day 1 = JD 1721425.5 (0001-01-01 00:00 UTC, proleptic Gregorian).
     1_721_425.5 + days_from_ce as f64 - 1.0

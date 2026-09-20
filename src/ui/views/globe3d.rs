@@ -5,7 +5,7 @@
 
 use crate::data::model::Sat;
 use crate::orbit::GeoPoint;
-use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use egui::{Color32, Painter, Pos2, Rect, Stroke, Vec2};
 
 /// Sphere tessellation, in latitude bands × longitude bands (vertices per
@@ -1021,19 +1021,13 @@ pub fn sun_direction(time: DateTime<Utc>) -> V3 {
 }
 
 /// Earth rotation (GMST, radians).
+///
+/// The GMST polynomial lives ONLY in `orbit::gmst_deg` (single source of
+/// truth): this used to carry its own copy, and both copies shared the same
+/// per-century/per-day rate bug. Delegating keeps the renderer's spin phase
+/// and the ground-track's longitude conversion (which also calls
+/// `orbit::gmst_deg`) provably identical, so a fix can never land in one place
+/// and silently miss the other again.
 pub fn earth_rotation(time: DateTime<Utc>) -> f64 {
-    gmst_deg(time).to_radians()
-}
-
-/// Greenwich Mean Sidereal Time in degrees.
-pub fn gmst_deg(time: DateTime<Utc>) -> f64 {
-    let day = NaiveDate::from_ymd_opt(time.year(), time.month(), time.day()).unwrap_or_default();
-    let jd0 = 1_721_425.5 + day.num_days_from_ce() as f64 - 0.5;
-    let jd = jd0
-        + time.hour() as f64 / 24.0
-        + time.minute() as f64 / 1440.0
-        + time.second() as f64 / 86_400.0;
-    let t = (jd - 2_451_545.0) / 36_525.0;
-    let gmst = 280.46061837 + 36_079.8750114 * t + 0.000_387_933 * t * t;
-    gmst.rem_euclid(360.0)
+    crate::orbit::gmst_deg(time).to_radians()
 }

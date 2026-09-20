@@ -1,8 +1,61 @@
 #[cfg(test)]
 mod tests {
     use super::super::globe3d::{earth_rotation, sun_direction, GlobeState, V3};
+    use crate::orbit::gmst_deg;
     use crate::ui::views::globe3d::rotate_to_cam_test_hook as rotate_to_cam;
     use chrono::{TimeZone, Utc};
+
+    /// Regression for TASK-017 (the 365×-slow sidereal rate): the linear term
+    /// is per DAY (360.98564736629°/day), so a full day of simulated time must
+    /// turn the Earth almost exactly one full revolution. With the old
+    /// per-century coefficient this was 0.9878°/day — this test would fail by
+    /// two orders of magnitude.
+    #[test]
+    fn gmst_rate_is_one_revolution_per_day() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 17, 0, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 9, 18, 0, 0, 0).unwrap();
+        // Unwrap the 360° per sidereal day: sidereal − solar rotation per
+        // solar day is 360.9856°, i.e. ~0.9856° more than a full turn.
+        let per_day = (gmst_deg(t1) - gmst_deg(t0)).rem_euclid(360.0);
+        assert!(
+            (per_day - 0.985_647).abs() < 0.01,
+            "GMST advanced {per_day}° in one day (expected that minus a full turn)"
+        );
+    }
+
+    /// GMST must match the standard value (IAU 1982 / Meeus) at several
+    /// instants. Reference values are astropy's `sidereal_time('mean','G')`
+    /// in the UT1 scale (agreeing with the IAU 2006 chain to ~2e-5°); the
+    /// polynomial used here is good to ~0.001° over 2000–2040, well inside the
+    /// 0.01° tolerance. This is the anti-regression guard for the TASK-017 bug.
+    #[test]
+    fn gmst_matches_standard_values() {
+        let cases = [
+            ((2000, 1, 1, 12, 0, 0), 280.460_62),
+            ((2026, 9, 17, 0, 0, 0), 355.943_51),
+            ((2026, 9, 17, 12, 0, 0), 176.436_34),
+            ((2030, 1, 1, 0, 0, 0), 100.691_65),
+            ((2036, 6, 15, 18, 0, 0), 174.601_74),
+        ];
+        for ((y, m, d, h, mi, s), want) in cases {
+            let t = Utc.with_ymd_and_hms(y, m, d, h, mi, s).unwrap();
+            let got = gmst_deg(t);
+            let diff = ((got - want + 180.0).rem_euclid(360.0)) - 180.0;
+            assert!(
+                diff.abs() < 0.01,
+                "gmst({y}-{m:02}-{d:02} {h:02}:{mi:02} UT) = {got}°, want {want}° (diff {diff:+.4}°)"
+            );
+        }
+    }
+
+    /// `globe3d::earth_rotation` must be exactly `orbit::gmst_deg` in radians:
+    /// the renderer and the ground-track now share one GMST, not two copies
+    /// that can drift apart.
+    #[test]
+    fn earth_rotation_delegates_to_orbit_gmst() {
+        let t = Utc.with_ymd_and_hms(2026, 9, 17, 12, 0, 0).unwrap();
+        assert_eq!(earth_rotation(t), gmst_deg(t).to_radians());
+    }
 
     /// The locked longitude must be horizontally centered (camera-space x ≈ 0)
     /// and on the visible disc (z > 0) when locked.
