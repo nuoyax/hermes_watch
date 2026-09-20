@@ -129,6 +129,12 @@ impl Default for Pane {
 }
 
 /// Draw pane chrome (border + title bar) inside `rect` on the painter.
+///
+/// TASK-023: this stays on the single shared `pane-frame` layer. The content
+/// layer exists but nothing painted on it can reach the title bar (`content`
+/// starts 18 px below `rect.min`), so the chrome keeps its place by being
+/// drawn on a different layer rather than by z-order inside one — panes do not
+/// overlap, so frame order between them is irrelevant.
 pub fn draw_pane_frame(
     ctx: &egui::Context,
     rect: Rect,
@@ -164,8 +170,41 @@ pub fn draw_pane_frame(
     )
 }
 
-/// Allocate a child UI in the given absolute-pixel rect of `ui`.
-pub fn pane_ui_at(ui: &mut Ui, pixels: Rect) -> Ui {
-    let child = ui.new_child(egui::UiBuilder::new().max_rect(pixels));
-    child
+/// The paint layer a pane's CONTENT lives on. Every pane needs its own: the 3D
+/// globe keys its per-pane mesh cache by `painter.layer_id()` (see
+/// `views::globe3d::show_globe`), so panes sharing one LayerId share one cache
+/// slot. With the pre-TASK-023 `Ui::new_child` (which *clones* the parent
+/// painter, LayerId included) all four panes collapsed onto a single slot and
+/// an idle pane replayed whichever pane drew last — the constant flicker
+/// between the panes ("光怎么突然在闪").
+pub fn pane_layer(index: usize) -> egui::LayerId {
+    egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new(("pane-content", index)),
+    )
+}
+
+/// A pane's content UI, sized to the absolute-pixel rect `pixels`, painting on
+/// the pane's OWN layer (`pane_layer(index)`).
+///
+/// Built with `Ui::new` rather than `Ui::new_child`: a child inherits the
+/// parent's painter, and egui 0.29 offers no public way to move a child's
+/// *widget registration* to another layer — `Ui::with_layer_id` redirects only
+/// the painting, leaving hit-testing (drag routing) on the parent's layer, and
+/// `Ui::painter` is read-only. A top-level `Ui` keeps painting and interaction
+/// on the same, correctly-set layer.
+///
+/// `move_to_top` lifts that layer above the panel background for hit-testing:
+/// the pane's layer becomes its own hit-test "area", and interaction from the
+/// previous pass is routed to the top-most area under the pointer (all panes
+/// keep receiving their own drags because their rects do not overlap).
+pub fn pane_ui_at(ctx: &egui::Context, index: usize, pixels: Rect) -> Ui {
+    let layer = pane_layer(index);
+    ctx.move_to_top(layer);
+    Ui::new(
+        ctx.clone(),
+        layer,
+        egui::Id::new(("pane-content-ui", index)),
+        egui::UiBuilder::new().max_rect(pixels),
+    )
 }

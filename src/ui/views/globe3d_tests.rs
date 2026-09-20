@@ -295,48 +295,311 @@ mod tests {
             .fold(0.0_f32, f32::max)
     }
 
-    /// Per-pane mesh cache slotting (TASK-012): each pane's cached mesh is
-    /// keyed by its egui `LayerId`, so pane B drawing a DIFFERENT frame must
-    /// not invalidate/replace pane A's entry. Two panes are rendered with
-    /// clearly different earth rotations (same camera, so `auto_reset` can't
-    /// interfere), then pane A is rendered again at its original rotation: its
-    /// mesh must be replayed from A's OWN cache (the 0.5 s throttle suppresses
-    /// the rebuild), i.e. identical to its first frame and clearly different
-    /// from pane B's. With a single shared slot, A's third frame would replay
-    /// B's stale mesh and this test goes red (verified by reverse testing).
+    // ---- TASK-023: panes must not share a mesh-cache slot -----------------
+
+    /// Layout for `n` panes side by side, with their centres far apart so
+    /// `render_panes` can check that each returned mesh really came from the
+    /// pane it is attributed to.
+    fn pane_rects(n: usize) -> Vec<egui::Rect> {
+        (0..n)
+            .map(|i| {
+                egui::Rect::from_min_size(
+                    egui::pos2(320.0 * i as f32, 0.0),
+                    egui::vec2(240.0, 240.0),
+                )
+            })
+            .collect()
+    }
+
+    /// A pane camera with `auto_reset` disabled (a pending `last_drag` keeps its
+    /// idle gate shut, so the yaw stays exactly where the test put it) and an
+    /// old `last_interaction` (not dragging unless a frame says so).
+    fn pane_cam(yaw: f64) -> GlobeState {
+        let mut cam = GlobeState::default();
+        cam.yaw = yaw;
+        cam.last_drag = Some(std::time::Instant::now());
+        cam.last_interaction =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        cam
+    }
+
+    /// Draw every pane in ONE frame through the REAL pane path — the content Ui
+    /// comes from `panes::pane_ui_at` inside a `CentralPanel`, exactly as
+    /// `App::content` obtains it — and return each pane's sphere-mesh vertices,
+    /// in pane order, with the `LayerId` each pane actually painted on.
+    ///
+    /// `drag[i]` marks pane i as dragging for this frame: `show_globe` rebuilds
+    /// a dragging pane's mesh unconditionally, which is how a test guarantees a
+    /// fresh cache entry. With `drag[i] == false` and no time passing between
+    /// frames the rebuild throttle holds, so the pane replays whatever its own
+    /// cache slot holds — exactly what a window the user is not touching does
+    /// in the running app.
+    ///
+    /// `earth_rot` is constant across the frames of these tests on purpose: an
+    /// idle pane replaying its own cache is then pixel-identical to its
+    /// previous frame, so any mismatch is provably another pane's mesh. (A
+    /// varying rotation would rebuild every pane and mask the bug.)
+    fn render_panes(
+        ctx: &egui::Context,
+        earth: &mut super::super::globe3d::Earth,
+        cams: &mut [GlobeState],
+        drag: &[bool],
+        earth_rot: f64,
+    ) -> (Vec<Vec<egui::Pos2>>, Vec<egui::LayerId>) {
+        let rects = pane_rects(cams.len());
+        let sun = sun_direction(Utc.with_ymd_and_hms(2026, 9, 17, 12, 0, 0).unwrap());
+        let mut layers = Vec::with_capacity(cams.len());
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {
+                for (i, cam) in cams.iter_mut().enumerate() {
+                    if drag[i] {
+                        cam.last_interaction = Some(std::time::Instant::now());
+                    }
+                    let ui = crate::ui::panes::pane_ui_at(ctx, i, rects[i]);
+                    layers.push(ui.painter().layer_id());
+                    super::super::globe3d::show_globe(
+                        ui.painter(),
+                        rects[i],
+                        cam,
+                        earth,
+                        sun,
+                        earth_rot,
+                        None,
+                        &[],
+                        None,
+                    );
+                }
+            });
+        });
+        let meshes: Vec<Vec<egui::Pos2>> = out
+            .shapes
+            .into_iter()
+            .filter_map(|s| match s.shape {
+                egui::epaint::Shape::Mesh(m) => Some(m.vertices.iter().map(|v| v.pos).collect()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(meshes.len(), cams.len(), "unexpected number of sphere meshes");
+        // Attribute every mesh to its pane by position (the sphere is centred on
+        // its pane): without this, a shifted pairing could satisfy the
+        // assertions below while the panes were misordered.
+        for (i, m) in meshes.iter().enumerate() {
+            let centroid =
+                m.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / m.len() as f32;
+            assert!(
+                (centroid - rects[i].center().to_vec2()).length() < 5.0,
+                "mesh {i} is not pane {i}'s (centroid {centroid:?}, pane centre {:?})",
+                rects[i].center()
+            );
+        }
+        (meshes, layers)
+    }
+
+    /// Register the pane-activation widget exactly as `App::content` does
+    /// (`ui.interact(content_rect, ("pane", i), Sense::click())` on the pane's
+    /// own Ui) and return which panes reported a click this frame.
+    fn click_frame(
+        ctx: &egui::Context,
+        n: usize,
+        input: egui::RawInput,
+    ) -> Vec<bool> {
+        let rects = pane_rects(n);
+        let mut clicked = vec![false; n];
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |_ui| {
+                for i in 0..n {
+                    let content = rects[i];
+                    let ui = crate::ui::panes::pane_ui_at(ctx, i, content);
+                    if ui
+                        .interact(content, egui::Id::new(("pane", i)), egui::Sense::click())
+                        .clicked()
+                    {
+                        clicked[i] = true;
+                    }
+                }
+            });
+        });
+        clicked
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool, time: f64) -> egui::RawInput {
+        egui::RawInput {
+            time: Some(time),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    /// TASK-023 guard: pane activation must still hit the pane under the
+    /// pointer. The panes now paint on their own layers, which also moves their
+    /// widget registration there — hit-testing is per layer (`hit_test` keeps
+    /// only the top-most layer's widgets), so an activation widget left behind
+    /// on the panel's layer, or a pane layer that has not been lifted above the
+    /// background, would make clicks land on the wrong pane or nowhere.
+    #[test]
+    fn pane_click_activates_that_pane_only() {
+        let ctx = egui::Context::default();
+        let rects = pane_rects(2);
+        let target = rects[1].center();
+
+        // Frame 0 registers the widgets, then a press/release pair inside pane 1.
+        click_frame(&ctx, 2, egui::RawInput::default());
+        click_frame(&ctx, 2, pointer_button(target, true, 0.0));
+        let clicked = click_frame(&ctx, 2, pointer_button(target, false, 0.05));
+
+        assert!(clicked[1], "the pane under the pointer was not activated");
+        assert!(!clicked[0], "a click on pane 1 also activated pane 0");
+    }
+
+    /// The mesh-cache key is the pane's `LayerId`; if two panes share one, the
+    /// cache is not per-pane no matter what the drawing code says. On the
+    /// pre-TASK-023 `Ui::new_child` path this is 1 distinct id out of 4 (`backg
+    /// 5A3E` four times) and this test goes red.
+    #[test]
+    fn panes_paint_on_distinct_layers() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let mut cams = vec![pane_cam(0.0), pane_cam(0.5), pane_cam(1.0), pane_cam(1.5)];
+        let (_, layers) = render_panes(&ctx, &mut earth, &mut cams, &[false; 4], 0.02);
+        let distinct: std::collections::HashSet<_> = layers.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            layers.len(),
+            "panes share a paint layer ({} distinct of {}): {:?}",
+            distinct.len(),
+            layers.len(),
+            layers
+        );
+    }
+
+    /// One pane's picture rendered on its own, on a private layer: the reference
+    /// for "what this pane should be showing". The private layer is deliberate —
+    /// this is the yardstick for the measurement, not the code under test.
+    fn render_isolated(
+        ctx: &egui::Context,
+        earth: &mut super::super::globe3d::Earth,
+        cam: &mut GlobeState,
+        rect: egui::Rect,
+        earth_rot: f64,
+    ) -> Vec<egui::Pos2> {
+        let sun = sun_direction(Utc.with_ymd_and_hms(2026, 9, 17, 12, 0, 0).unwrap());
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            let p = egui::Painter::new(
+                ctx.clone(),
+                egui::LayerId::new(
+                    egui::Order::Background,
+                    egui::Id::new("task023-isolated-reference"),
+                ),
+                rect,
+            );
+            super::super::globe3d::show_globe(&p, rect, cam, earth, sun, earth_rot, None, &[], None);
+        });
+        let mut shapes: Vec<egui::epaint::Shape> =
+            out.shapes.into_iter().map(|s| s.shape).collect();
+        let i = shapes
+            .iter()
+            .position(|s| matches!(s, egui::epaint::Shape::Mesh(_)))
+            .expect("show_globe drew no mesh");
+        match shapes.remove(i) {
+            egui::epaint::Shape::Mesh(m) => m.vertices.iter().map(|v| v.pos).collect(),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Per-pane mesh cache slotting (TASK-012), driven through the REAL pane
+    /// path so it tests the thing that actually broke: `panes::pane_ui_at` must
+    /// give each pane a distinct egui `LayerId`, because that LayerId is the
+    /// mesh-cache key. Before TASK-023 `pane_ui_at` built the pane Ui with
+    /// `Ui::new_child`, which CLONES the parent painter — LayerId included — so
+    /// every pane hashed to one slot and the second frame below replayed the
+    /// other pane's mesh (measured 640 px off on that code; see TASK-023).
     #[test]
     fn mesh_cache_is_slotted_per_pane() {
         let ctx = egui::Context::default();
         let mut earth = super::super::globe3d::Earth::load();
-        let mut cam = GlobeState::default();
-        // Keep `auto_reset` out of the way (it would drift `yaw` toward the
-        // sun-facing heading); an active drag keeps the idle gate closed.
-        cam.last_drag = Some(std::time::Instant::now());
-        cam.yaw = 0.0;
+        let mut cams = vec![pane_cam(0.0), pane_cam(0.9)];
 
-        // Two distinct panes, each with its own LayerId. Same camera, two
-        // different earth rotations: that is what made the 4 panes invalidate
-        // each other's single shared slot every frame.
-        let layer_a = egui::LayerId::new(egui::Order::Background, egui::Id::new("pane-A"));
-        let layer_b = egui::LayerId::new(egui::Order::Background, egui::Id::new("pane-B"));
+        // Frame 1 rebuilds both panes (both marked dragging), leaving one entry
+        // per pane; frames 2 and 3 cannot rebuild anything (nothing drags, the
+        // throttle holds), so a pane can only show whatever its slot holds.
+        let (first, _) = render_panes(&ctx, &mut earth, &mut cams, &[true, true], 0.02);
+        let (second, _) = render_panes(&ctx, &mut earth, &mut cams, &[false, false], 0.02);
+        let (third, _) = render_panes(&ctx, &mut earth, &mut cams, &[false, false], 0.02);
 
-        let a1 = render_globe_mesh(&ctx, &mut earth, &mut cam, layer_a, 0.02);
-        let b1 = render_globe_mesh(&ctx, &mut earth, &mut cam, layer_b, 0.60);
-        let a2 = render_globe_mesh(&ctx, &mut earth, &mut cam, layer_a, 0.02);
-
-        // Sanity: the two panes really do show different frames, so replaying
-        // the wrong slot is actually detectable.
         assert!(
-            max_delta(&a1, &b1) > 5.0,
+            max_delta(&first[0], &first[1]) > 5.0,
             "test needs two visibly different panes (delta={})",
-            max_delta(&a1, &b1)
+            max_delta(&first[0], &first[1])
         );
-        // The invariant: pane A replays A's own cached mesh.
+        // Pane 0 replays its OWN slot, not pane 1's...
         assert!(
-            max_delta(&a1, &a2) < 1e-4,
-            "pane A replayed another pane's cached mesh (delta={})",
-            max_delta(&a1, &a2)
+            max_delta(&first[0], &second[0]) < 1e-4,
+            "pane 0 replayed another pane's cached mesh (delta={})",
+            max_delta(&first[0], &second[0])
         );
+        // ...because a replay really happened (pane 0's picture differs from
+        // pane 1's, so the assertion above would have caught the shared slot).
+        assert!(
+            max_delta(&second[0], &first[1]) > 5.0,
+            "test needs the two slots to hold different meshes (delta={})",
+            max_delta(&second[0], &first[1])
+        );
+        // And the replay is stable: pane 0's slot still holds pane 0's mesh.
+        assert!(
+            max_delta(&second[0], &third[0]) < 1e-4,
+            "pane 0's own cached mesh changed between replays (delta={})",
+            max_delta(&second[0], &third[0])
+        );
+    }
+
+    /// The symptom the user reported ("光怎么突然在闪"): with a shared cache slot
+    /// an idle pane replays the dragging pane's mesh, so it alternates between
+    /// its own view and the dragger's even though nothing about it changed.
+    /// Every frame the idle pane must show its own picture, and the dragging
+    /// pane must not be able to affect it.
+    #[test]
+    fn idle_pane_keeps_its_own_view_while_another_pane_drags() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let mut cams = vec![pane_cam(0.0), pane_cam(0.9)];
+        let rects = pane_rects(2);
+
+        // Pane 1's own correct picture, alone on a private layer.
+        let mut ref_cam = pane_cam(0.9);
+        let reference = render_isolated(&ctx, &mut earth, &mut ref_cam, rects[1], 0.02);
+
+        // Frame 0: both panes build (pane 1's entry has to be its own before the
+        // idle frames can be checked). Then six frames in which ONLY pane 0
+        // drags — mirroring the real app, whose sim clock keeps the dragging
+        // pane rebuilding every frame.
+        let (first, _) = render_panes(&ctx, &mut earth, &mut cams, &[true, true], 0.02);
+        assert!(
+            max_delta(&first[1], &reference) < 1e-4,
+            "frame 0: pane 1 did not draw its own view (delta={})",
+            max_delta(&first[1], &reference)
+        );
+        assert!(
+            max_delta(&first[0], &reference) > 5.0,
+            "test needs the two panes to differ (delta={})",
+            max_delta(&first[0], &reference)
+        );
+        for frame in 1..7 {
+            let (m, _) = render_panes(&ctx, &mut earth, &mut cams, &[true, false], 0.02);
+            assert!(
+                max_delta(&m[1], &reference) < 1e-4,
+                "idle pane showed something other than its own view on frame {frame} \
+                 (delta={})",
+                max_delta(&m[1], &reference)
+            );
+        }
     }
 
     /// A locked pane must look the same as the Earth turns underneath: the

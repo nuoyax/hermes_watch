@@ -412,11 +412,14 @@ pub fn show_globe(
         sun_dir_ef.2.to_bits(),
         earth_rot.to_bits(),
     );
-    // PER-PANE mesh cache, keyed by the pane's egui LayerId. A single shared
-    // slot made the 4 panes invalidate each other's cache every frame (each
-    // pane has its own camera pose), so pane A's rebuild forced pane B to
-    // replay a stale mesh with mismatched overlays — the persistent flicker.
-    // Keying by LayerId gives every pane its own independent cache.
+    // PER-PANE mesh cache, keyed by the pane's egui LayerId. The key is only
+    // worth anything because TASK-023 made each pane draw on its OWN layer
+    // (`panes::pane_layer`): before that, `panes::pane_ui_at` used
+    // `Ui::new_child`, which *clones* the parent painter — LayerId included —
+    // so all four panes hashed to one slot. A single slot makes the drawing
+    // pane (rebuilding every frame) evict every idle pane's entry, so the idle
+    // pane replays the dragger's mesh for the frames between rebuilds: the
+    // 143 px / 0 px alternation that read as the globe "flashing".
     thread_local! {
         static MESH_CACHE: std::cell::RefCell<Option<std::collections::HashMap<egui::LayerId, ((u64, u64, u32, u64, u64, u64, u64), egui::Mesh, std::time::Instant, (f64, f64))>>> =
             const { std::cell::RefCell::new(None) };

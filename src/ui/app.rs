@@ -410,15 +410,19 @@ impl App {
                     let content =
                         panes::draw_pane_frame(ctx, pixels, &title, i == self.active_pane);
 
-                    // Click to activate pane.
-                    if ui
-                        .interact(pixels, egui::Id::new(("pane", i)), egui::Sense::click())
+                    // Click to activate pane. Registered before the view's own
+                    // widgets so a click on a list row / button inside the pane
+                    // still wins (same ordering as before TASK-023); it must
+                    // live in the pane's own Ui, i.e. on the pane's own layer —
+                    // hit-testing is per layer, so an activation widget left on
+                    // the panel layer would be shadowed by the pane layer.
+                    let mut child = panes::pane_ui_at(ctx, i, content);
+                    if child
+                        .interact(content, egui::Id::new(("pane", i)), egui::Sense::click())
                         .clicked()
                     {
                         self.active_pane = i;
                     }
-
-                    let mut child = panes::pane_ui_at(ui, content);
                     // View lock buttons in the pane's title bar (jump globe to a
                     // timezone's longitude). No return value: the frame is
                     // repainted unconditionally (`request_repaint_after` in
