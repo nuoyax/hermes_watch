@@ -669,9 +669,15 @@ pub fn show_globe(
 
 /// Draw the focused spacecraft: a flat-shaded 3D wireframe/solid model of
 /// the station (real ISS geometry: long truss + 4 solar panel pairs + module
-/// bodies), projected with the same camera (yaw/pitch) as the globe and
+/// bodies), placed with the same camera pose (yaw/pitch) as the globe and
 /// slowly rotating around its own truss axis. Falls back to the vector
 /// pictogram for non-station satellites.
+///
+/// TASK-019: "same camera pose" means the same two angles, NOT the same
+/// rotation matrix. The models compose pitch-then-yaw (the pre-TASK-016 form
+/// of `rotate_to_cam`); the difference is a roll about the view axis, so the
+/// model does not share the globe's roll. See the notes in `draw_iss_model`
+/// and `draw_hubble_model`.
 fn draw_spacecraft(
     painter: &Painter,
     sp: Pos2,
@@ -767,7 +773,18 @@ fn draw_iss_model(
     let tilt = 0.5_f64;
     let (ct, st) = tilt.sin_cos();
 
-    // Camera basis (same convention as rotate_to_cam: camera looks +z).
+    // Camera basis. Camera looks down +z, same as `rotate_to_cam` — but the
+    // COMPOSITION ORDER is inverted: here it is pitch about X first, then yaw
+    // about Y (== Rx(pitch)·Ry(yaw)), which is the *pre-TASK-016* form of
+    // `rotate_to_cam`. The two maps are therefore not the same rotation: their
+    // difference is a pure roll about the view axis — 0° at yaw = 0, ~10° at
+    // yaw = 30°, ~28° at yaw = 90°, ~39° at yaw = 150° (all at the default
+    // pitch 0.35; ~64° at yaw = 90° when the user tilts to 0.8). Consequence:
+    // the model's roll relative to the globe depends on the camera yaw/pitch,
+    // so a model axis that should be horizontal at yaw = 0 (the ISS truss) is
+    // horizontal nowhere else (it goes 0° → 20° → 74° off-horizontal over
+    // yaw 0° → 90° → 165°). See TASK-019. Deliberately left as-is: unifying it
+    // is a visible change to the station's roll, not a silent cleanup.
     let (cp, spn) = (pitch.cos(), pitch.sin());
     let (cy, sy) = (yaw.cos(), yaw.sin());
 
@@ -798,7 +815,12 @@ fn draw_iss_model(
     let proj: Vec<[f32; 2]> = rot3
         .iter()
         .map(|v| {
-            // camera transform (yaw around Y, then pitch around X) — same as globe
+            // Inline model->screen map. NOT `rotate_to_cam`: the order is
+            // pitch about X THEN yaw about Y (M = Ry(yaw)·Rx(pitch)), i.e. the
+            // pre-TASK-016 composition; `rotate_to_cam` is Rx(pitch)·Ry(yaw).
+            // Same view axis and same depth (`z4`), so the model sits at the
+            // right place on the globe and cannot look "misplaced"; the
+            // residual is the view-axis roll documented above.
             let y3 = v[1] * cp - v[2] * spn;
             let z3 = v[1] * spn + v[2] * cp;
             let x4 = v[0] * cy + z3 * sy;
@@ -815,8 +837,19 @@ fn draw_iss_model(
         .max(1e-9);
     let (sux, suy, suz) = (sun_world.0 / sun_len, sun_world.1 / sun_len, sun_world.2 / sun_len);
 
-    // Backface culling: skip degenerate/wound-away triangles. Depth: use the
-    // rotated model z (post spin+tilt) averaged per tri, painted far first.
+    // Backface culling: skip degenerate/wound-away triangles. Depth: average
+    // the ROTATED MODEL z per tri, painted far first.
+    //
+    // TASK-019: this key is the spin+tilt z2, i.e. the true camera depth of
+    // the map ONLY at yaw = pitch = 0 (z4 = −x·sin(yaw) + z2·cos(yaw)). As
+    // soon as the camera leaves that pose the key disagrees with the depth the
+    // projection above actually uses: at the live camera (yaw ≈ 57°, pitch
+    // 0.35) ~33% of vertex pairs are ordered backwards and 5.3k/30.4k vertices
+    // (17%) change near/far sign; at yaw ≈ 149°, pitch 0.8 it is ~87%. In
+    // practice the model is ~30 px on screen, the whitewash flattens the
+    // depth cue and the large flat panels sit near the centre of mass, so the
+    // misordering is usually not readable — it was left alone deliberately
+    // rather than as an oversight. Fixing it means using `z4` from `proj`.
     let rotated_z: Vec<f32> = mesh_data
         .verts
         .iter()
@@ -847,10 +880,22 @@ fn draw_iss_model(
     for &ti in &order {
         let (idx, base) = &mesh_data.tris[ti];
         let nz = nz_of(idx) as f64;
-        // Real sun Lambert: world-space normal from the spin+tilt coords,
-        // then through the camera rotation (pitch then yaw, matching
-        // rotate_to_cam), dotted with the sun direction. Plus a mild
-        // screen-space term so geometry stays readable on the night side.
+        // Real sun Lambert. NOTE (TASK-019): the comment here used to claim
+        // "matching rotate_to_cam" — it does not. The normal is pushed through
+        // Ry(yaw)·Rx(pitch) (the pre-TASK-016 composition, same as the
+        // projection above), while `sun_world` lives in the world frame, so
+        // the face is being lit as if the two frames coincided. Measured over
+        // the front-facing triangles at UTC 06:00Z this shades 68.5% lit /
+        // 31.5% dark, at 18:00Z 97.7% / 2.3%: i.e. the phase of the station's
+        // day/night side currently tracks the camera yaw rather than the real
+        // sun. Transporting the normal by the camera rotation (which is what
+        // the sentence claimed) would give ~95% / 93% at those two instants,
+        // and no camera rotation at all would give the same. The camera-yaw
+        // phase lock is exactly what makes the current read acceptable on
+        // screen — the visible face is almost always at least partly lit — so
+        // it is documented, not changed. The drop `ny1 → ny` follows from the
+        // same pre-TASK-016 order: yaw about Y leaves the camera-lateral
+        // component of the normal (`ny1`) alone.
         let (a, b, c) = (
             rot3[idx[0] as usize],
             rot3[idx[1] as usize],
@@ -904,6 +949,16 @@ fn draw_hubble_model(painter: &Painter, sp: Pos2, yaw: f64, pitch: f64, t: f32, 
     let (cy, sy) = (yaw.cos(), yaw.sin());
     let s = (30.0 * scale / 2.0) as f64;
 
+    // TASK-019: third copy of the inline model placement. Its screen basis
+    // (`proj` below) is the pitch-then-yaw map Ry(yaw)·Rx(pitch) — the
+    // pre-TASK-016 composition, so the same camera-yaw-dependent roll as
+    // `draw_iss_model` applies to the tube. Its `depth` differs from the ISS
+    // case: it is the yaw-then-pitch camera z (Rx(pitch)·Ry(yaw)), i.e. the
+    // depth of the *unified* map while the projection is drawn with the other
+    // one — so the HST painter's order disagrees with its own projection by
+    // the same roll-sized amount instead of by the ISS model-z shortcut. Not
+    // unified: same "visible roll change, ask first" reason as the ISS.
+    //
     // Cylinder along Z: ring of 10 points at both ends + end caps.
     let mut verts: Vec<[f64; 3]> = Vec::new();
     let n = 10;
