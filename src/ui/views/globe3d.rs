@@ -284,11 +284,13 @@ impl V3 {
 /// Convention: camera looks down +z (a point faces the viewer when its
 /// camera-space z equals +r). Yaw spins around the polar axis; pitch tilts.
 fn rotate_to_cam(v: V3, r: f64, yaw: f64, pitch: f64) -> V3 {
-    let (cp, sp) = (pitch.cos(), pitch.sin());
-    let y2 = v.1 * cp - v.2 * sp;
-    let z2 = v.1 * sp + v.2 * cp;
+    // 1) yaw about the polar axis (the camera orbits in longitude)
     let (cy, sy) = (yaw.cos(), yaw.sin());
-    V3((v.0 * cy + z2 * sy) * r, y2 * r, (-v.0 * sy + z2 * cy) * r)
+    let x1 = v.0 * cy + v.2 * sy;
+    let z1 = -v.0 * sy + v.2 * cy;
+    // 2) pitch about the camera's own horizontal axis (camera latitude)
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    V3(x1 * r, (v.1 * cp - z1 * sp) * r, (v.1 * sp + z1 * cp) * r)
 }
 
 fn project(v: V3, center: Pos2) -> (Pos2, f64) {
@@ -325,7 +327,12 @@ pub fn show_globe(
     // subsolar lon + GMST; the camera sits at world +90°), so as time
     // passes the view slowly follows the sun like a solar-locked observer.
     // A manual drag overrides it freely; auto-reset glides back to the sun.
-    let sun_yaw = sun_dir_ef.0.atan2(sun_dir_ef.2) + earth_rot
+    // The subsolar point's world longitude is `atan2(sun_ef.z, sun_ef.x) +
+    // earth_rot` (the mesh places Earth-fixed lon L at world lon L + GMST, and
+    // `sun_dir_ef` is the Earth-fixed subsolar direction). With the new
+    // yaw-then-pitch `rotate_to_cam` a point faces the viewer at
+    // `yaw = world_lon - 90°`, hence:
+    let sun_yaw = sun_dir_ef.2.atan2(sun_dir_ef.0) + earth_rot
         - std::f64::consts::FRAC_PI_2;
     // When the camera is follow-locked (e.g. a timezone jump), `auto_reset`
     // must NOT ease `yaw` toward the sun-facing yaw — the lock's yaw is
