@@ -30,6 +30,22 @@ const DRAG_ACTIVE_SECS: f64 = 0.5;
 /// the throttle (see `dragging`) because gesture latency matters more there.
 const MESH_REBUILD_INTERVAL_SECS: f64 = 0.5;
 
+/// Test hook for the rebuild budget above: a regression test has to know the
+/// real window to tell a replayed mesh from a rebuilt one, without the constant
+/// itself leaving this module. `#[cfg(test)]`, like the other `*_test_hook`
+/// items below.
+#[cfg(test)]
+pub(crate) const MESH_REBUILD_INTERVAL_SECS_FOR_TEST: f64 = MESH_REBUILD_INTERVAL_SECS;
+
+/// A camera glide whose remaining distance is below this (radians) is over as
+/// far as the eye is concerned: 1e-3 rad ≈ 0.06°, which at the default zoom
+/// (r = 100 px) is about a tenth of a pixel. It is the threshold at which
+/// `auto_reset` stops claiming the per-frame mesh rebuild (clearing
+/// `GlobeState::easing`) — the glide itself keeps its own settling rule and
+/// speed, untouched. Same order of magnitude as the 1e-3 the deliberate pitch
+/// ease settles at (`settle_pitch`).
+const EASE_VISIBLE_RAD: f64 = 1e-3;
+
 /// ISS whitewash: fraction of the baked material colour mixed toward white.
 /// Trade-off between night-side readability (module/panel geometry stays
 /// visible against the dark limb) and colour fidelity of the real model.
@@ -63,6 +79,25 @@ pub struct GlobeState {
     /// zone's latitude; unlocking eases back to `DEFAULT_PITCH`). `None`
     /// once settled.
     pub pitch_target: Option<f64>,
+    /// An `auto_reset` glide was still moving the camera as of the last
+    /// rendered frame. Unlike `pitch_target` — the other in-flight flag, which
+    /// the deliberate eases set OUTSIDE the renderer — `auto_reset` both runs
+    /// inside `show_globe` and keeps its own convergence rule, so it cannot
+    /// publish a target. It therefore has to announce itself: this flag is
+    /// refreshed by `auto_reset` on every frame it actually moves the camera
+    /// and cleared as soon as the glide is over. `show_globe` reads it to let
+    /// an idle reset render at full rate (a 2 Hz-quantized glide is the
+    /// reported "复位有卡顿").
+    ///
+    /// It is a member of `GlobeState` for the same reason the camera angles
+    /// are: `show_globe` borrows `cam` mutably one call at a time, so a local
+    /// it could keep between frames would have to travel through every caller.
+    /// The invariant that makes that safe is structural rather than incidental:
+    /// `show_globe` is the flag's single writer besides `auto_reset` (it clears
+    /// it whenever no reset could be running — follow-locked frames), and
+    /// `easing` in `show_globe` additionally re-checks the preconditions, so a
+    /// stale `true` can never widen the rebuild bypass.
+    pub easing: bool,
 }
 
 impl Default for GlobeState {
@@ -78,6 +113,7 @@ impl Default for GlobeState {
             current_yaw: 0.0,
             last_drag: None,
             pitch_target: None,
+            easing: false,
         }
     }
 }
@@ -126,6 +162,24 @@ impl GlobeState {
         // rendered (== `lon + gmst - 90°` for that frame). Adopting it as the
         // free-camera yaw continues the exact same heading: the frame before
         // and after the unlock render at the same angle, so nothing jumps.
+        //
+        // The alternative — keep the free-camera `yaw` the lock froze and hand
+        // it back here — was measured and rejected: while locked, `yaw` is the
+        // heading the camera had BEFORE the lock, so resuming from it is only
+        // continuous if the camera was already pointing there when the lock was
+        // taken. It is not in general, and the error is exactly the size of the
+        // lock's own jump (`toggle_zone` sets `pitch_target` and redirects
+        // `effective_yaw`; it does not move the camera gradually). Measured on
+        // this file's fixtures: a pane dragged to yaw 2.4 whose reset glide was
+        // interrupted by a Beijing lock at 2.08 rad renders the locked heading
+        // while locked; unlocking to `current_yaw` moves the drawn pose by 0 px,
+        // unlocking to the frozen `yaw` moves it by 1.27 rad ≈ 127 px. A pristine
+        // pane (never dragged, `yaw` still 0.0) is worse: 3.11 rad ≈ a full
+        // turn of the sphere. See `unlock_resumes_the_heading_it_was_locked_on`.
+        //
+        // Note this is the same choice `drag` makes when it releases a lock, and
+        // for the same reason: the locked heading is what the user is looking
+        // at, so it is what the camera must continue from.
         self.yaw = self.current_yaw;
         self.lock_lon = None;
         self.lock_lat = None;
@@ -155,8 +209,11 @@ impl GlobeState {
         self.pitch_target = None; // a drag cancels any pending pitch ease
         if self.lock_lon.is_some() {
             // Releasing the follow-lock: adopt the camera's actual heading so
-            // the view doesn't snap back to the stale manual yaw. (The pitch
-            // is deliberately left where the drag put it.)
+            // the drag continues from where the locked view was pointing
+            // instead of snapping back to the frozen free-camera yaw. Same
+            // choice `unlock` makes and for the same reason — the locked
+            // heading is what the user is looking at. (The pitch is deliberately
+            // left where the drag put it.)
             self.yaw = self.current_yaw;
         }
         self.lock_lon = None; // manual drag releases the follow-lock
@@ -206,6 +263,7 @@ impl GlobeState {
             .map(|t| t.elapsed().as_secs_f64())
             .unwrap_or(f64::INFINITY);
         if idle < IDLE_RESET {
+            self.easing = false; // nothing gliding — the idle gate is shut
             return;
         }
         // Stay out of the way while a deliberate pitch ease is in flight
@@ -215,14 +273,26 @@ impl GlobeState {
         // fresh `GlobeState` (`last_drag == None`) the idle gate never trips,
         // so a zone jump's latitude centring could never actually settle.
         if self.pitch_target.is_some() {
+            // That ease announces itself through `pitch_target`; this flag is
+            // the *auto-reset* glide's voice and must not speak for it.
+            self.easing = false;
             return;
         }
+        let yaw_gap = base_yaw - self.yaw;
+        let pitch_gap = Self::default().pitch - self.pitch;
         if self.pitch != Self::default().pitch || self.yaw != base_yaw {
             // Small per-frame factor → exponential glide of ~2 s (at 60 fps).
             let k = 0.03f32;
-            self.pitch += (Self::default().pitch - self.pitch) * k as f64;
-            self.yaw += (base_yaw - self.yaw) * k as f64;
+            self.pitch += pitch_gap * k as f64;
+            self.yaw += yaw_gap * k as f64;
         }
+        // Publish the glide so `show_globe` can render an idle reset at full
+        // rate instead of quantizing it to 2 Hz (the reported "复位有卡顿").
+        // `true` exactly while the camera is still visibly moving, so a settled
+        // pane returns to the ordinary 0.5 s rebuild budget — this flag never
+        // gates the glide itself, which keeps the convergence rule above.
+        self.easing =
+            yaw_gap.abs() > EASE_VISIBLE_RAD || pitch_gap.abs() > EASE_VISIBLE_RAD;
         if idle > IDLE_RESET + 5.0 {
             self.last_drag = None; // settled — stop easing
         }
@@ -303,6 +373,75 @@ pub fn rotate_to_cam_test_hook(v: V3, r: f64, yaw: f64, pitch: f64) -> V3 {
     rotate_to_cam(v, r, yaw, pitch)
 }
 
+/// PER-PANE mesh cache, keyed by the pane's egui LayerId. The key is only worth
+/// anything because TASK-023 made each pane draw on its OWN layer
+/// (`panes::pane_layer`): before that, `panes::pane_ui_at` used `Ui::new_child`,
+/// which *clones* the parent painter — LayerId included — so all four panes
+/// hashed to one slot. A single slot makes the drawing pane (rebuilding every
+/// frame) evict every idle pane's entry, so the idle pane replays the dragger's
+/// mesh for the frames between rebuilds: the 143 px / 0 px alternation that read
+/// as the globe "flashing".
+///
+/// Entry layout: `(mesh_key, mesh, built_at, (yaw, pitch) the mesh was built
+/// with)`. It is a `thread_local` because egui caches are per-thread and the
+/// tests (like the app) render every pane of a frame on one thread.
+///
+/// `pub(crate)` (the only visibility widening in this module) exists so the
+/// throttle regression tests can reach INSIDE an entry: `backdate_mesh_build_for_test`
+/// rewrites `built_at` to test the wall-clock throttle rule deterministically
+/// instead of racing the test scheduler, and `mesh_build_age_for_test` reads it
+/// back for assertions.
+pub(crate) type MeshCache = std::cell::RefCell<
+    Option<
+        std::collections::HashMap<
+            egui::LayerId,
+            (
+                (u64, u64, u32, u64, u64, u64, u64),
+                egui::Mesh,
+                std::time::Instant,
+                (f64, f64),
+            ),
+        >,
+    >,
+>;
+thread_local! {
+    pub(crate) static MESH_CACHE: MeshCache = const { std::cell::RefCell::new(None) };
+}
+
+/// Backdate a pane's cached mesh build time, so a test can make the throttle
+/// window deterministically expired without sleeping or depending on how long
+/// the scheduler let a frame run. `age_secs` is relative to now; panes with no
+/// cache entry on this thread are ignored.
+///
+/// This is the difference between testing the throttle and testing the
+/// scheduler: the rule is wall-clock, so a wall-clock test can always be red
+/// through no fault of the renderer. With an injected timestamp the test states
+/// exact preconditions ("this mesh was built now" / "half a window ago") and the
+/// assertion means what it says on any machine.
+#[cfg(test)]
+pub(crate) fn backdate_mesh_build_for_test(layer: egui::LayerId, age_secs: f64) {
+    MESH_CACHE.with(|c| {
+        if let Some(map) = c.borrow_mut().as_mut() {
+            if let Some(entry) = map.get_mut(&layer) {
+                entry.2 = std::time::Instant::now() - std::time::Duration::from_secs_f64(age_secs);
+            }
+        }
+    });
+}
+
+/// Age of a pane's cached mesh build, in seconds. `None` when this thread holds
+/// no entry for `layer` — which a caller must treat as "no mesh to reason about"
+/// rather than as an age.
+#[cfg(test)]
+pub(crate) fn mesh_build_age_for_test(layer: egui::LayerId) -> Option<f64> {
+    MESH_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|map| map.get(&layer))
+            .map(|entry| entry.2.elapsed().as_secs_f64())
+    })
+}
+
 /// Rotate an Earth-fixed vector into the world frame (+GMST about the polar
 /// axis). Shared by `show_globe`'s lighting and pinned by
 /// `lighting_frame_consistent`: both callers must use THIS one map, so a
@@ -361,6 +500,15 @@ pub fn show_globe(
     let locked = cam.lock_lon.is_some();
     if !locked {
         cam.auto_reset(sun_yaw);
+    } else {
+        // A follow-lock suppresses `auto_reset` entirely (see above), so this is
+        // the only place that can retire its glide flag while locked — the
+        // bypass below reads `easing`, and a stale `true` here would drop this
+        // pane to a full sphere rebuild EVERY frame for the whole lock, which is
+        // the sustained 4-pane load the throttle exists to prevent. Assigned on
+        // every locked frame, not only on the transition into the lock, so the
+        // invariant holds no matter which path set the flag.
+        cam.easing = false;
     }
     // Pitch easing runs in BOTH states: a zone jump eases toward the zone's
     // latitude, an unlock eases back to the default tilt.
@@ -412,22 +560,37 @@ pub fn show_globe(
         sun_dir_ef.2.to_bits(),
         earth_rot.to_bits(),
     );
-    // PER-PANE mesh cache, keyed by the pane's egui LayerId. The key is only
-    // worth anything because TASK-023 made each pane draw on its OWN layer
-    // (`panes::pane_layer`): before that, `panes::pane_ui_at` used
-    // `Ui::new_child`, which *clones* the parent painter — LayerId included —
-    // so all four panes hashed to one slot. A single slot makes the drawing
-    // pane (rebuilding every frame) evict every idle pane's entry, so the idle
-    // pane replays the dragger's mesh for the frames between rebuilds: the
-    // 143 px / 0 px alternation that read as the globe "flashing".
-    thread_local! {
-        static MESH_CACHE: std::cell::RefCell<Option<std::collections::HashMap<egui::LayerId, ((u64, u64, u32, u64, u64, u64, u64), egui::Mesh, std::time::Instant, (f64, f64))>>> =
-            const { std::cell::RefCell::new(None) };
-    }
+    // PER-PANE mesh cache — see `MESH_CACHE` at module scope for the keying and
+    // the TASK-023 history behind it.
     let mesh_layer = painter.layer_id();
     let dragging = cam.last_interaction
         .map(|t| now.duration_since(t).as_secs_f64() < DRAG_ACTIVE_SECS)
         .unwrap_or(false);
+    // Is a camera EASE in flight this frame? Two independent sources of motion
+    // both have to reach this point, or a glide gets quantized to the 0.5 s
+    // rebuild period and reads as visible stutter — the reported
+    // "怎么复位有卡顿的感觉":
+    //   * `cam.easing` — an `auto_reset` glide, refreshed by `auto_reset` just
+    //     above on free frames and CLEARED on locked ones (a lock suppresses
+    //     `auto_reset`, so nothing else could retire the flag);
+    //   * `pitch_target.is_some()` — the deliberate eases, which `unlock` /
+    //     `toggle_zone` set OUTSIDE the renderer. `auto_reset` never sets that
+    //     field (it returns early whenever one is pending), so it can never
+    //     stand in for the flag above.
+    // The `!locked` guard is load-bearing on its own: `toggle_zone` sets
+    // `pitch_target` WHILE it takes the follow-lock, and that deliberate ease
+    // settles in ~0.7 s, long before the lock ends. Without the guard, `easing`
+    // would stay true for the entire lock — a lock is a sustained state, not an
+    // animation — and this pane would rebuild a 10.5k-vertex sphere on every
+    // frame of it, exactly the load the 0.5 s budget exists to bound. A locked
+    // camera is never gliding: its yaw is recomputed from the lock every frame
+    // and its pitch ease is not throttled into stutter.
+    // Note an ease deliberately does NOT refresh `last_interaction` (that field
+    // is pointer-gesture state, and a reset is not a pointer gesture), so
+    // `dragging` alone can never cover either case. A pane that is neither
+    // easing nor being dragged keeps its exact 0.5 s rebuild budget — the
+    // AMD-driver guard that let four panes run at once.
+    let easing = !locked && (cam.easing || cam.pitch_target.is_some());
     // Which yaw/pitch the CACHED mesh was built with. While a rebuild is
     // throttled (replaying the stale mesh), everything else drawn this frame
     // (orbit ring, satellite, marker) must use the SAME yaw/pitch — mixing a
@@ -450,8 +613,11 @@ pub fn show_globe(
                         // full 10.5k-vertex sphere every frame per pane and can
                         // deadlock the AMD OpenGL driver under sustained load.
                         // Rebuild at most once per `MESH_REBUILD_INTERVAL_SECS` —
-                        // unless the user is dragging, where latency matters.
+                        // unless the user is dragging, or the camera is easing
+                        // back into place: both are continuous animations where
+                        // latency is visible as stutter.
                         dragging
+                            || easing
                             || now.duration_since(*built).as_secs_f64()
                                 > MESH_REBUILD_INTERVAL_SECS
                     } else {

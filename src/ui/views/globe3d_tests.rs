@@ -4,6 +4,10 @@ mod tests {
         earth_fixed_to_world_test_hook as earth_fixed_to_world, earth_rotation, sun_direction,
         GlobeState, V3,
     };
+    /// `globe3d`'s rebuild throttle is private to that module; this test-hook
+    /// alias is what lets the tests measure the real window without widening the
+    /// constant's visibility outside `globe3d`.
+    use super::super::globe3d::MESH_REBUILD_INTERVAL_SECS_FOR_TEST as MESH_REBUILD_INTERVAL_SECS;
     use crate::data::model::{Sat, SatGroup, Tle};
     use crate::orbit::gmst_deg;
     use crate::ui::views::globe3d::rotate_to_cam_test_hook as rotate_to_cam;
@@ -950,6 +954,461 @@ mod tests {
             "marker slid with the Earth: {:?} vs {:?}",
             drawn[0],
             drawn[1]
+        );
+    }
+
+    // ---- the "复位有卡顿" report: an EASING camera must not be throttled ----
+
+    /// Regression for the reported stutter ("怎么复位有卡顿的感觉"): a camera that
+    /// is EASING — an in-flight `pitch_target`, which `auto_reset` (yaw) and
+    /// `unlock`/`toggle_zone` (pitch) both drive — must rebuild its sphere mesh
+    /// EVERY frame.
+    ///
+    /// The ease advances `pitch` on every rendered frame (`settle_pitch`) but
+    /// never refreshes `last_interaction`: that field is pointer-gesture state,
+    /// and a reset is not a pointer gesture. So `dragging` is false throughout
+    /// the ease and the 0.5 s `MESH_REBUILD_INTERVAL_SECS` throttle held, which
+    /// quantized a continuous 0.7 s glide into two visible jumps per second —
+    /// the camera pose kept advancing while the sphere on screen did not.
+    ///
+    /// Each frame is compared against a FRESH re-render of the SAME requested
+    /// pose, on a private layer per frame: an empty cache slot always rebuilds,
+    /// so that reference is exactly "the picture the camera asked for this
+    /// frame". While the throttle holds, the cached pane shows an older pitch
+    /// than it was asked for and this goes red.
+    #[test]
+    fn easing_camera_rebuilds_the_mesh_every_frame() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 240.0));
+        let earth_rot = 0.35_f64;
+
+        let mut cam = GlobeState::default();
+        cam.pitch = 1.1; // as far from the default as the drag clamp allows
+        cam.pitch_target = Some(GlobeState::DEFAULT_PITCH); // the ease is in flight
+        // A pointer gesture that has LONG expired: this pane is not being
+        // dragged, so the `dragging` bypass does not apply. This is the whole
+        // point — the reset ease has no pointer gesture to ride on.
+        cam.last_interaction =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        // Keep `auto_reset`'s idle gate shut so the ONLY motion under test is
+        // the pitch ease: the mesh-key changes then come from `pitch` alone,
+        // and a fixed `yaw` keeps the comparison unambiguous.
+        cam.last_drag = Some(std::time::Instant::now());
+
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("ease-pane"));
+        let mut last_pitch = cam.pitch;
+        for frame in 0..6 {
+            let (drawn, _) =
+                render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, earth_rot, None);
+
+            // The ease really is advancing the requested pose on this frame...
+            assert!(
+                cam.pitch_target.is_some() && (cam.pitch - last_pitch).abs() > 1e-4,
+                "frame {frame}: the ease is not in flight (pitch {last_pitch} -> {})",
+                cam.pitch
+            );
+            last_pitch = cam.pitch;
+
+            // ...so the sphere on screen must be the one for that pose. The
+            // reference re-renders the identical camera state on a fresh layer,
+            // where an empty cache slot forces the rebuild. It is a COPY of the
+            // live state, so both in-flight markers are pinned to this frame's
+            // pose: a reference that kept gliding inside the comparison frame
+            // would be comparing two different poses (that is why the copy may
+            // not be left for `auto_reset`/`settle_pitch` to advance).
+            let mut reference_cam = cam;
+            reference_cam.pitch_target = Some(cam.pitch);
+            reference_cam.easing = false;
+            let reference_layer =
+                egui::LayerId::new(egui::Order::Background, egui::Id::new(("ease-ref", frame)));
+            let (want, _) = render_globe_frame(
+                &ctx,
+                &mut earth,
+                &mut reference_cam,
+                reference_layer,
+                rect,
+                earth_rot,
+                None,
+            );
+
+            assert!(
+                max_delta(&drawn, &want) < 1e-4,
+                "frame {frame}: the sphere is stale (delta={}) — drawn at an older pose than \
+                 the requested pitch {}",
+                max_delta(&drawn, &want),
+                cam.pitch
+            );
+        }
+    }
+
+    /// The counterweight to the test above: widening the rebuild rule for an
+    /// EASING camera must not weaken the 0.5 s throttle for a pane that is
+    /// doing nothing at all.
+    ///
+    /// A free pane (no lock) with no ease in flight and no pointer gesture is
+    /// exactly the steady state of four idle windows sitting side by side, and
+    /// the throttle there is the historical guard against hanging the AMD
+    /// OpenGL driver under sustained 4-pane load. The sim clock keeps
+    /// advancing, so the mesh key changes on every frame and the
+    /// `MESH_REBUILD_INTERVAL_SECS` window is the ONLY thing holding the
+    /// rebuild back — make the bypass unconditional and this goes red.
+    ///
+    /// Note the sphere's vertex positions carry the `lon + gdeg` term, so a
+    /// rebuild at the new `earth_rot` visibly MOVES the mesh (the Earth turns
+    /// under a free camera): a replayed mesh is compared against the frame that
+    /// built it and must be pixel-identical.
+    ///
+    /// `last_drag` is set to NOW rather than to an instant just inside the 5 s
+    /// idle gate: those two frames are milliseconds apart, so the idle time this
+    /// test actually needs to stay under is five seconds, not the rebuild
+    /// interval — with a backdated `last_drag` a loaded machine could let
+    /// `auto_reset`'s gate trip between the two frames, glide the camera and
+    /// rebuild the mesh for a reason this test is not about. "Dragged this very
+    /// instant" says the same thing with no dependence on wall-clock jitter.
+    ///
+    /// Both frames are REBUILDS, not replays: each is rendered on a layer this
+    /// test has not used, so the cache slot starts empty and both frames
+    /// unconditionally build a fresh mesh at their own `earth_rot`. The replayed
+    /// case this test is about is then produced by backdating the SECOND
+    /// build to half the window ago (see `backdate`: a frame's own duration can
+    /// exceed the window on a loaded machine, which is what made the earlier
+    /// wall-clock form of this test flaky) and rendering a THIRD frame with a
+    /// fresh `earth_rot`. That third mesh must be byte-identical to the second —
+    /// a rebuild would move it by tens of pixels.
+    #[test]
+    fn idle_pane_is_still_throttled() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 240.0));
+        let layer =
+            egui::LayerId::new(egui::Order::Background, egui::Id::new("idle-throttle-frame"));
+        let replayed_layer =
+            egui::LayerId::new(egui::Order::Background, egui::Id::new("idle-throttle-replay"));
+
+        let mut cam = GlobeState::default();
+        cam.yaw = 0.4;
+        cam.pitch_target = None; // no ease in flight — the case under test
+        cam.last_interaction =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        cam.last_drag = Some(std::time::Instant::now()); // `auto_reset` gated shut
+
+        // Frame 1 (earth_rot = 0.0) builds its own mesh unconditionally.
+        let (built, _) =
+            render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, 0.0, None);
+        // Frame 2 (earth_rot = 0.5) is the mesh that must be replayed; it is
+        // built unconditionally the same way, then given an age that is inside
+        // the window but large enough that a THIRD frame's own render time
+        // cannot push its key-vs-built gap past the window.
+        let (wanted, _) =
+            render_globe_frame(&ctx, &mut earth, &mut cam, replayed_layer, rect, 0.5, None);
+        super::super::globe3d::backdate_mesh_build_for_test(
+            replayed_layer,
+            MESH_REBUILD_INTERVAL_SECS * 0.5,
+        );
+        // Frame 3 says the sim clock advanced again (key changed). Inside the
+        // window that must replay the cached mesh, not rebuild it.
+        let (again, _) =
+            render_globe_frame(&ctx, &mut earth, &mut cam, replayed_layer, rect, 0.9, None);
+
+        assert!(
+            max_delta(&built, &wanted) > 5.0,
+            "the test needs two visibly different meshes (delta={})",
+            max_delta(&built, &wanted)
+        );
+        assert!(
+            max_delta(&wanted, &again) < 1e-4,
+            "an idle pane rebuilt its mesh inside the throttle window (delta={}) — the \
+             four-pane rebuild budget is gone",
+            max_delta(&wanted, &again)
+        );
+    }
+
+    /// The path the user actually reported: NO pane is touched, the pointer is
+    /// nowhere near the window — 5 s after the last drag `auto_reset` glides the
+    /// camera back to the sun-facing view, and that glide must render at full
+    /// rate.
+    ///
+    /// This is NOT the case `easing_camera_rebuilds_the_mesh_every_frame` above
+    /// covers, and the difference is the whole point: `auto_reset` runs *inside*
+    /// `show_globe` and returns early whenever `pitch_target.is_some()`, so
+    /// `pitch_target` is `None` for the entire glide. Before this task's flag,
+    /// the rebuild bypass had nothing to fire on and the reset stayed quantized
+    /// to 2 Hz — a camera that keeps advancing while the sphere on screen only
+    /// jumps every 0.5 s, which is the reported "怎么复位有卡顿的感觉".
+    ///
+    /// The camera here is free (no follow-lock) with a `last_drag` 6 s in the
+    /// past, i.e. exactly the idle gate `auto_reset` needs, and nothing else
+    /// moves it: `last_interaction` is long expired so the drag bypass cannot
+    /// help, and the base yaw is the camera's own (`yaw == base_yaw`), isolating
+    /// the glide to `pitch` — so the mesh key changes only because the glide
+    /// advanced it, which is what makes the stale-mesh assertion unambiguous.
+    #[test]
+    fn idle_auto_reset_glide_rebuilds_the_mesh_every_frame() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 240.0));
+        let earth_rot = 0.35_f64;
+
+        let mut cam = GlobeState::default();
+        cam.pitch = 1.1; // the tilt a drag would have left behind
+        cam.yaw = 2.4; // == base_yaw for this test (see above)
+        cam.pitch_target = None; // no deliberate ease: the AUTO-RESET path
+        // The test guards below require the glide to still be moving on frame 5,
+        // so the idle window has to outlast the six render frames. Each frame is
+        // ~110 ms (a full sphere rebuild), so 6 s of headroom covers the ~0.7 s
+        // of rendering by a wide margin — and unlike a few-hundred-ms margin it
+        // cannot be eaten by the test dispatcher deciding to spawn the next test
+        // between two frames. (`auto_reset`'s gate is a wall-clock 5 s; the glide
+        // itself is per-frame and therefore independent of that margin.)
+        cam.last_drag = Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+        cam.last_interaction =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("auto-reset-pane"));
+        let mut last_pitch = cam.pitch;
+        for frame in 0..6 {
+            let (drawn, _) =
+                render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, earth_rot, None);
+
+            // Guard the test itself: the glide must still be moving, otherwise
+            // the comparison below could pass on a camera that has settled.
+            assert!(
+                cam.pitch_target.is_none(),
+                "frame {frame}: a deliberate ease started — this is not the auto-reset path"
+            );
+            assert!(
+                (cam.pitch - last_pitch).abs() > 1e-4,
+                "frame {frame}: the auto-reset glide is not in flight (pitch {last_pitch} -> {})",
+                cam.pitch
+            );
+            last_pitch = cam.pitch;
+
+            // The sphere must be the one for the pose this frame actually has.
+            // The reference copy pins BOTH in-flight markers (see above) so it
+            // renders exactly this pose; its own layer is empty, so it rebuilds.
+            let mut reference_cam = cam;
+            reference_cam.pitch_target = Some(cam.pitch);
+            reference_cam.easing = false;
+            let reference_layer = egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new(("auto-reset-ref", frame)),
+            );
+            let (want, _) = render_globe_frame(
+                &ctx,
+                &mut earth,
+                &mut reference_cam,
+                reference_layer,
+                rect,
+                earth_rot,
+                None,
+            );
+
+            assert!(
+                max_delta(&drawn, &want) < 1e-4,
+                "frame {frame}: the sphere is stale (delta={}) — the reset glide advanced the \
+                 camera to pitch {} while the pane kept replaying its throttled mesh",
+                max_delta(&drawn, &want),
+                cam.pitch
+            );
+        }
+    }
+
+    /// TASK-027 follow-up: a follow-lock must return the pane to the ordinary
+    /// 0.5 s rebuild budget, even when it is taken WHILE an `auto_reset` glide is
+    /// still in flight.
+    ///
+    /// `auto_reset` is skipped entirely on locked frames (the lock computes its
+    /// own yaw, so easing toward the sun would make the two yaws alternate — the
+    /// "切到北京" lighting flicker), and `toggle_zone` sets `pitch_target` on the
+    /// way into the lock. So the locked frame is the one state where the pane
+    /// can neither run nor retire the glide's in-flight flag, and a bypass that
+    /// trusted that flag blindly would stay open for the WHOLE lock: a lock is a
+    /// sustained state, not an animation, so "one more frame" never arrives and
+    /// the pane rebuilds a 10.5k-vertex sphere at full frame rate for as long as
+    /// the user leaves the zone selected. That is the sustained 4-pane load the
+    /// throttle exists to bound (see `MESH_REBUILD_INTERVAL_SECS`).
+    ///
+    /// The glide here is in flight when the lock is taken (asserted below, so a
+    /// later refactor that reordered `toggle_zone` could not quietly turn this
+    /// into a test of nothing), and the lock is held across the two frames being
+    /// compared.
+    #[test]
+    fn locked_pane_is_throttled_even_when_the_lock_interrupts_a_glide() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 240.0));
+
+        let mut cam = GlobeState::default();
+        cam.pitch = 1.1;
+        cam.yaw = 2.4;
+        cam.last_drag = Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+        cam.last_interaction =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+
+        // An idle frame first: `auto_reset` starts gliding and claims the flag...
+        let warmup =
+            egui::LayerId::new(egui::Order::Background, egui::Id::new("locked-after-glide-warmup"));
+        render_globe_frame(&ctx, &mut earth, &mut cam, warmup, rect, 0.35, None);
+        assert!(
+            cam.pitch_target.is_none() && cam.easing,
+            "the glide is not in flight when the lock is taken (pitch_target={:?}, easing={}) \
+             — this test would not exercise the leak",
+            cam.pitch_target,
+            cam.easing
+        );
+
+        // ...then the user picks a timezone while it is still gliding.
+        cam.toggle_zone("Beijing", 116.4, 39.9);
+        assert!(
+            cam.lock_lon.is_some() && cam.pitch_target.is_some(),
+            "the zone jump did not take the lock / start its pitch ease"
+        );
+        // The button click is a pointer interaction, so `dragging` covers the
+        // next `DRAG_ACTIVE_SECS` on its own (by design — gesture latency). The
+        // defect is what is left when that window closes: the glide has claimed
+        // the bypass and, with `auto_reset` suppressed by the lock, nothing ever
+        // hands it back. Backdate the gesture to that point.
+        cam.last_interaction =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        assert!(
+            cam.lock_lon.is_some(),
+            "the test needs the lock to still be held while not dragging"
+        );
+
+        // Two REBUILDS (each on a layer this test has not used), then the replay:
+        // the second build is backdated to half the window ago, so the third
+        // frame's key change must REPLAY rather than rebuild. Timestamps are
+        // injected instead of measured (see `backdate_mesh_build_for_test`) — the
+        // throttle rule is wall-clock, and a frame's own duration can exceed the
+        // window on a loaded machine, which is what made the wall-clock form of
+        // this test flaky.
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("locked-pane"));
+        let replayed_layer =
+            egui::LayerId::new(egui::Order::Background, egui::Id::new("locked-pane-replay"));
+        let (built, _) = render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, 0.0, None);
+        let (wanted, _) =
+            render_globe_frame(&ctx, &mut earth, &mut cam, replayed_layer, rect, 0.5, None);
+        super::super::globe3d::backdate_mesh_build_for_test(
+            replayed_layer,
+            MESH_REBUILD_INTERVAL_SECS * 0.5,
+        );
+        let (again, _) =
+            render_globe_frame(&ctx, &mut earth, &mut cam, replayed_layer, rect, 0.9, None);
+
+        let age = super::super::globe3d::mesh_build_age_for_test(replayed_layer)
+            .expect("the replayed pane has no cache entry to inspect");
+        assert!(
+            age < MESH_REBUILD_INTERVAL_SECS,
+            "the throttle precondition is not live: the inspected build is {age:.3} s old, \
+             past the {MESH_REBUILD_INTERVAL_SECS} s window — the gap this test left for the \
+             frames' own render time was eaten"
+        );
+        // (a) the claim must be gone by the time the locked frame is drawn.
+        assert!(
+            !cam.easing,
+            "the glide flag is still set while follow-locked — the pane would rebuild its \
+             sphere every frame for the whole lock"
+        );
+        // (b) and the locked pane must therefore be replaying its mesh. The two
+        // poses here differ by only a couple of pixels — a follow-locked camera
+        // deliberately holds its view while the Earth turns under it (see
+        // `locked_render_stays_put_while_earth_turns`) and its pitch ease moves a
+        // few hundredths of a radian per frame — so the sanity check below is
+        // "not identical", while the replay tolerance is two orders of magnitude
+        // tighter. A rebuild at either pose would land far outside it.
+        assert!(
+            max_delta(&built, &wanted) > 1e-3,
+            "the test needs two distinguishable meshes (delta={})",
+            max_delta(&built, &wanted)
+        );
+        assert!(
+            max_delta(&wanted, &again) < 1e-4,
+            "a locked pane rebuilt its mesh inside the throttle window (delta={}) — a lock \
+             that interrupts a glide leaves the rebuild bypass open forever",
+            max_delta(&wanted, &again)
+        );
+    }
+
+    /// Unlock continuity: releasing a follow-lock must resume the heading the
+    /// camera is ALREADY rendering, not the free-camera yaw the lock froze.
+    ///
+    /// `toggle_zone` does not glide into the lock — it redirects `effective_yaw`
+    /// in one frame — so while locked the free-camera `yaw` (untouched since the
+    /// drag, and never rewritten by the locked path) is a DIFFERENT heading from
+    /// the one on screen. `unlock` therefore has to adopt `current_yaw`, the yaw
+    /// the last rendered frame actually used, or the view jumps back to `yaw`
+    /// the moment the lock is released.
+    ///
+    /// Measured on this fixture (`pitch = 1.1`, `yaw = 2.4`, glide in flight,
+    /// `r = 100 px`): the locked heading is ~1.27 rad ≈ 127 px away from the
+    /// frozen `yaw` — about 16% of the probe's whole 149-frame reset travel, and
+    /// an order of magnitude above the largest per-frame step of the glide
+    /// itself. A pane that was never dragged is worse (`yaw` still 0.0): 3.11 rad,
+    /// i.e. the lock released onto a heading a full turn away.
+    ///
+    /// Every pose below is the yaw a rendered frame ACTUALLY drew
+    /// (`current_yaw`), so this pins the visible jump rather than a field value.
+    #[test]
+    fn unlock_resumes_the_heading_it_was_locked_on() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 240.0));
+        let layer = egui::LayerId::new(egui::Order::Background, egui::Id::new("unlock-continuity"));
+
+        let mut cam = GlobeState::default();
+        cam.pitch = 1.1; // the tilt a drag would have left behind
+        cam.yaw = 2.4;
+        cam.last_drag = Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+        cam.last_interaction =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+
+        // A free `auto_reset` glide, rendered for a few frames.
+        for _ in 0..3 {
+            render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, 0.35, None);
+        }
+        assert!(
+            cam.easing && cam.pitch_target.is_none(),
+            "the free-camera reset glide is not in flight — this test would not exercise \
+             the interrupted-glide case"
+        );
+        let pose_before_lock = cam.current_yaw;
+        let yaw_at_lock = cam.yaw;
+
+        // The user picks a timezone mid-glide, and the locked view is rendered.
+        cam.toggle_zone("Beijing", 116.4, 39.9);
+        for _ in 0..2 {
+            render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, 0.35, None);
+        }
+        let pose_locked = cam.current_yaw;
+        assert!(
+            (cam.yaw - yaw_at_lock).abs() < 1e-12,
+            "the locked path rewrote the free-camera yaw ({} -> {})",
+            yaw_at_lock,
+            cam.yaw
+        );
+        assert!(
+            (pose_locked - pose_before_lock).abs() > 0.4,
+            "the lock did not move the view ({} -> {}) — nothing to be discontinuous with",
+            pose_before_lock,
+            pose_locked
+        );
+
+        // ...and releases it. The next rendered frame must continue the locked
+        // view, not the frozen free-camera yaw.
+        cam.toggle_zone("Beijing", 116.4, 39.9); // toggle off -> unlock
+        assert!(cam.lock_lon.is_none());
+        render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, 0.35, None);
+        let pose_after_unlock = cam.current_yaw;
+
+        let jump = (pose_after_unlock - pose_locked).abs();
+        assert!(
+            jump < 1e-3,
+            "unlock jumped {jump:.3} rad (~{:.0} px at r = {}) — it resumed the frozen \
+             free-camera yaw {yaw_at_lock} instead of the heading {pose_locked} the locked \
+             frames were rendering",
+            jump * cam.zoom as f64,
+            cam.zoom
         );
     }
 }
