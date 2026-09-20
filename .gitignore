@@ -11,6 +11,7 @@ assets/s1.json
 assets/sc.json
 assets/t.json
 docs/shot.png
+docs/shot_small.png
 
 # Superseded assets: nothing in src/ or the READMEs references these any more
 # (the ISS renders from assets/iss_model_nasa.bin). .gitignore does not delete
