@@ -4,6 +4,7 @@ mod tests {
         earth_fixed_to_world_test_hook as earth_fixed_to_world, earth_rotation, sun_direction,
         GlobeState, V3,
     };
+    use crate::data::model::{Sat, SatGroup, Tle};
     use crate::orbit::gmst_deg;
     use crate::ui::views::globe3d::rotate_to_cam_test_hook as rotate_to_cam;
     use chrono::{TimeZone, Utc};
@@ -737,6 +738,218 @@ mod tests {
         assert!(
             (cam.yaw - first).abs() > 1e-6,
             "unlock adopted the frozen first-frame yaw ({first})"
+        );
+    }
+
+    // ---- TASK-024: the locked marker must not depend on the satellite ----
+    //
+    // These go through `show_globe` and read the drawn SHAPES back, because the
+    // bug they guard was positional: the marker block sat after the focused-
+    // satellite early return, so a shape-list check is the only honest way to
+    // say "the marker was (not) drawn". Re-deriving the crosshair position from
+    // `GlobeState` in the test would have been green on the broken code —
+    // exactly the failure mode TASK-023's earlier test had.
+
+    /// The locked-marker colour, duplicated from `show_globe` so the test can
+    /// recognise a crosshair in the shape list. Kept as a literal (not
+    /// imported) because a change to the drawn colour SHOULD surface here.
+    const CROSSHAIR_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 210, 80);
+
+    fn x_input() -> egui::RawInput {
+        egui::RawInput::default()
+    }
+    /// Render ONE frame of `show_globe` and return the sphere mesh's vertices
+    /// together with the centre of every crosshair stroke in the frame.
+    ///
+    /// `earth_rot` and `sat` are per-call arguments (unlike the older
+    /// `render_globe_mesh` above) so a test can walk one pane's camera through
+    /// several frames — including no-satellite frames, which is the case
+    /// TASK-024 is about.
+    fn render_globe_frame(
+        ctx: &egui::Context,
+        earth: &mut super::super::globe3d::Earth,
+        cam: &mut GlobeState,
+        layer: egui::LayerId,
+        rect: egui::Rect,
+        earth_rot: f64,
+        sat: Option<&Sat>,
+    ) -> (Vec<egui::Pos2>, Vec<egui::Pos2>) {
+        let sun = sun_direction(Utc.with_ymd_and_hms(2026, 9, 17, 12, 0, 0).unwrap());
+        let out = ctx.run(x_input(), |ctx| {
+            let p = egui::Painter::new(ctx.clone(), layer, rect);
+            super::super::globe3d::show_globe(&p, rect, cam, earth, sun, earth_rot, sat, &[], None);
+        });
+        let shapes: Vec<egui::epaint::Shape> = out.shapes.into_iter().map(|s| s.shape).collect();
+        let mesh = match shapes
+            .iter()
+            .find(|s| matches!(s, egui::epaint::Shape::Mesh(_)))
+            .expect("show_globe drew no sphere mesh")
+        {
+            egui::epaint::Shape::Mesh(m) => m.vertices.iter().map(|v| v.pos).collect(),
+            _ => unreachable!(),
+        };
+        let mut strokes = Vec::new();
+        for s in &shapes {
+            if let egui::epaint::Shape::LineSegment {
+                points: [a, b],
+                stroke,
+            } = s
+            {
+                if stroke.color == egui::epaint::ColorMode::Solid(CROSSHAIR_COLOR) {
+                    strokes.push(egui::pos2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0));
+                }
+            }
+        }
+        (mesh, strokes)
+    }
+
+    /// The locked marker's centre, recovered from the crosshair strokes of a
+    /// frame. One crosshair paints exactly two segments (the horizontal and the
+    /// vertical bar) and they cross at the marker's centre, so this counts the
+    /// markers drawn AND reports where the single one was drawn.
+    fn marker_center(strokes: &[egui::Pos2]) -> egui::Pos2 {
+        assert_eq!(
+            strokes.len(),
+            2,
+            "expected one crosshair (2 strokes, got {}): a locked marker was not drawn?",
+            strokes.len()
+        );
+        assert!(
+            strokes[0].distance(strokes[1]) < 1e-3,
+            "the two crosshair strokes do not cross at one point: {:?} vs {:?}",
+            strokes[0],
+            strokes[1]
+        );
+        strokes[0]
+    }
+
+    fn dummy_sat(name: &str) -> Sat {
+        Sat {
+            norad_id: 1,
+            name: name.to_owned(),
+            group: SatGroup::Station,
+            tle: Tle {
+                line1: String::new(),
+                line2: String::new(),
+            },
+        }
+    }
+
+    /// TASK-024 regression: a pane with a follow-lock but NO focused satellite
+    /// must still draw the locked crosshair.
+    ///
+    /// The lock lives on the pane's `GlobeState` — `app::title_bar_buttons`
+    /// writes `lock_lon/lock_lat/lock_label` into the pane the user clicked, and
+    /// never touches `focus_norad` — while the marker used to be drawn after
+    /// `let Some(sat) = sat else { return }`. Clicking "Beijing" on a pane with
+    /// no satellite therefore showed no crosshair at all (a pane that has not
+    /// been seeded yet, or one whose `focus_norad` is `None`).
+    ///
+    /// Driven through `show_globe` itself: the marker must be IN the shape list
+    /// of the no-satellite frame, at the projected locked point, and it must
+    /// land in the same place when the same call does have a satellite — the
+    /// fix changes WHEN the marker is drawn, not WHERE.
+    #[test]
+    fn lock_marker_drawn_without_focused_satellite() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 240.0));
+        let earth_rot = 0.35_f64;
+
+        let mut cam = GlobeState::default();
+        cam.toggle_zone("Beijing", 116.4, 39.9);
+        // Pin the tilt: `settle_pitch` eases `pitch` every rendered frame
+        // toward the zone's latitude, and the expected position below is derived
+        // from the pose the SAME frame renders.
+        cam.pitch_target = None;
+
+        // Where the locked point projects, through the production camera map
+        // (yaw from the lock itself, the pitch the camera holds).
+        let yaw = cam.effective_yaw_for_test(earth_rot);
+        let (la_r, lo_r) = (
+            39.9_f64.to_radians(),
+            (116.4_f64 + earth_rot.to_degrees()).to_radians(),
+        );
+        let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+        let v = rotate_to_cam(n, cam.zoom as f64 * 1.002, yaw, cam.pitch);
+        let want = egui::pos2(rect.center().x + v.0 as f32, rect.center().y - v.1 as f32);
+        assert!(v.2 > 0.0, "test needs the locked point on the near side");
+
+        // No satellite at all — this is the case that used to draw nothing.
+        let layer_a = egui::LayerId::new(egui::Order::Background, egui::Id::new("task024-no-sat"));
+        let (_, strokes) = render_globe_frame(
+            &ctx, &mut earth, &mut cam, layer_a, rect, earth_rot, None,
+        );
+        let drawn = marker_center(&strokes);
+        assert!(
+            drawn.distance(want) < 1e-3,
+            "crosshair at {drawn:?}, expected the locked point at {want:?}"
+        );
+
+        // A satellite-focused frame draws the marker at the same spot.
+        let layer_b = egui::LayerId::new(egui::Order::Background, egui::Id::new("task024-with-sat"));
+        let sat = dummy_sat("ISS (ZARYA)");
+        let (_, strokes_sat) = render_globe_frame(
+            &ctx, &mut earth, &mut cam, layer_b, rect, earth_rot, Some(&sat),
+        );
+        let drawn_sat = marker_center(&strokes_sat);
+        assert!(
+            drawn_sat.distance(drawn) < 1e-3,
+            "crosshair moved when a satellite was focused: {drawn:?} vs {drawn_sat:?}"
+        );
+    }
+
+    /// TASK-024 companion regression: the marker must be drawn by the SAME
+    /// renderer path that draws the sphere, and it must stay glued to the
+    /// locked point as the Earth turns under it.
+    ///
+    /// Two frames on two layers (fresh meshes, no throttle involved), 0.5 rad
+    /// of Earth rotation apart: the sphere must be identical (see
+    /// `locked_render_stays_put_while_earth_turns`) and the marker must be
+    /// drawn in BOTH frames at the projected locked point. A marker that reads
+    /// different camera state per frame — or that is not drawn at all, which is
+    /// what the pre-TASK-024 early return did whenever no satellite was
+    /// focused — fails here.
+    #[test]
+    fn locked_marker_stays_on_the_locked_point_while_earth_turns() {
+        let ctx = egui::Context::default();
+        let mut earth = super::super::globe3d::Earth::load();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 240.0));
+
+        let mut cam = GlobeState::default();
+        cam.toggle_zone("Beijing", 116.4, 39.9);
+        cam.pitch = 0.0;
+        cam.pitch_target = None; // hold the tilt for the comparison
+
+        let mut drawn = Vec::new();
+        for (name, earth_rot) in [("A", 0.0_f64), ("B", 0.5)] {
+            let layer =
+                egui::LayerId::new(egui::Order::Background, egui::Id::new(("task024", name)));
+            let (_, strokes) =
+                render_globe_frame(&ctx, &mut earth, &mut cam, layer, rect, earth_rot, None);
+            drawn.push(marker_center(&strokes));
+
+            // The locked meridian faces the viewer, so the marker sits on the
+            // pane's vertical centre line at the locked longitude's latitude.
+            let yaw = cam.effective_yaw_for_test(earth_rot);
+            let (la_r, lo_r) = (
+                39.9_f64.to_radians(),
+                (116.4_f64 + earth_rot.to_degrees()).to_radians(),
+            );
+            let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+            let v = rotate_to_cam(n, cam.zoom as f64 * 1.002, yaw, cam.pitch);
+            let want = egui::pos2(rect.center().x + v.0 as f32, rect.center().y - v.1 as f32);
+            assert!(
+                drawn.last().unwrap().distance(want) < 1e-3,
+                "marker at {:?}, expected the locked point at {want:?} (frame {name})",
+                drawn.last().unwrap()
+            );
+        }
+        assert!(
+            drawn[0].distance(drawn[1]) < 1e-3,
+            "marker slid with the Earth: {:?} vs {:?}",
+            drawn[0],
+            drawn[1]
         );
     }
 }

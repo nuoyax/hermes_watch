@@ -543,6 +543,46 @@ pub fn show_globe(
     let render_yaw = if mesh_changed { yaw } else { mesh_yaw };
     let render_pitch = if mesh_changed { pitch } else { mesh_pitch };
 
+    // Locked-location marker (timezone jump): a crosshair + label so the
+    // viewer can see exactly where the locked point is on the globe.
+    //
+    // Drawn BEFORE the focused-satellite early-return below. The follow-lock is
+    // per-pane CAMERA state: `app::title_bar_buttons` writes `lock_lon/lat/label`
+    // into THIS pane's `GlobeState` regardless of whether the pane has a focused
+    // satellite, so a pane the user pointed at "Beijing" while it had nothing
+    // selected must still show the crosshair — kept after the early return this
+    // block was silently skipped for every such pane. Nothing here reads `sat`;
+    // it is placed after `render_yaw`/`render_pitch` so the marker lands on the
+    // pose of the sphere actually on screen (a replayed mesh while the rebuild
+    // throttle holds), never on a fresher pose than the sphere it sits on.
+    if let (Some(lon), Some(lat), Some(label)) = (cam.lock_lon, cam.lock_lat, cam.lock_label) {
+        let (la_r, lo_r) = (lat.to_radians(), (lon + earth_rot.to_degrees()).to_radians());
+        let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
+        let cam_v = rotate_to_cam(n, r as f64 * 1.002, render_yaw, render_pitch);
+        let (mp, z) = project(cam_v, center);
+        let behind = z < 0.0 && mp.distance(center) < r;
+        if !behind {
+            let cross = 6.0 * scale as f32;
+            let col = Color32::from_rgb(255, 210, 80);
+            painter.line_segment(
+                [mp - Vec2::new(cross, 0.0), mp + Vec2::new(cross, 0.0)],
+                Stroke::new(1.5, col),
+            );
+            painter.line_segment(
+                [mp - Vec2::new(0.0, cross), mp + Vec2::new(0.0, cross)],
+                Stroke::new(1.5, col),
+            );
+            painter.circle_stroke(mp, 9.0 * scale as f32, Stroke::new(1.2, col));
+            painter.text(
+                mp + Vec2::new(12.0 * scale as f32, 0.0),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional((10.0 * scale as f32).max(9.0)),
+                col,
+            );
+        }
+    }
+
     let Some(sat) = sat else { return };
     let color = sat.group.color();
 
@@ -635,36 +675,6 @@ pub fn show_globe(
                 format!("{} · {} km", sat.name, p.alt_km as i32),
                 egui::FontId::proportional((11.0 * scale as f32).max(9.0)),
                 Color32::WHITE,
-            );
-        }
-    }
-
-    // Locked-location marker (timezone jump): a crosshair + label so the
-    // viewer can see exactly where the locked point is on the globe.
-    if let (Some(lon), Some(lat), Some(label)) = (cam.lock_lon, cam.lock_lat, cam.lock_label) {
-        let (la_r, lo_r) = (lat.to_radians(), (lon + earth_rot.to_degrees()).to_radians());
-        let n = V3(la_r.cos() * lo_r.cos(), la_r.sin(), la_r.cos() * lo_r.sin());
-        let cam_v = rotate_to_cam(n, r as f64 * 1.002, render_yaw, render_pitch);
-        let (mp, z) = project(cam_v, center);
-        let behind = z < 0.0 && mp.distance(center) < r;
-        if !behind {
-            let cross = 6.0 * scale as f32;
-            let col = Color32::from_rgb(255, 210, 80);
-            painter.line_segment(
-                [mp - Vec2::new(cross, 0.0), mp + Vec2::new(cross, 0.0)],
-                Stroke::new(1.5, col),
-            );
-            painter.line_segment(
-                [mp - Vec2::new(0.0, cross), mp + Vec2::new(0.0, cross)],
-                Stroke::new(1.5, col),
-            );
-            painter.circle_stroke(mp, 9.0 * scale as f32, Stroke::new(1.2, col));
-            painter.text(
-                mp + Vec2::new(12.0 * scale as f32, 0.0),
-                egui::Align2::LEFT_CENTER,
-                label,
-                egui::FontId::proportional((10.0 * scale as f32).max(9.0)),
-                col,
             );
         }
     }
