@@ -599,7 +599,7 @@ impl App {
         // Light surface: the rows themselves are black text (see `row_color`),
         // which the dark theme this app uses elsewhere would swallow whole.
         egui::SidePanel::left("sidebar")
-            .default_width(280.0)
+            .default_width(220.0)
             .frame(
                 egui::Frame::side_top_panel(&ctx.style())
                     .fill(egui::Color32::from_rgb(242, 242, 245)),
@@ -682,9 +682,11 @@ impl App {
                     let pane = self.panes[i].clone();
                     // Each pane tracks exactly one satellite.
                     let focus_sat = pane.focus_norad.and_then(|n| Self::sat_by_norad(sats, n));
+                    // Just the satellite: the view already has a lit 3D/2D
+                    // button in this same bar, so naming it again was noise.
                     let title = match &focus_sat {
-                        Some(sat) => format!("{} — {}", pane.view.label(), sat.name),
-                        None => format!("{} — (select a satellite)", pane.view.label()),
+                        Some(sat) => sat.name.clone(),
+                        None => "(select a satellite)".to_string(),
                     };
                     let content =
                         panes::draw_pane_frame(ctx, pixels, &title, i == self.active_pane);

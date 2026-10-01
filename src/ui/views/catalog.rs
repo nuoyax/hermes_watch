@@ -117,13 +117,13 @@ pub fn show_catalog(
     invalid: &HashSet<u32>,
     pane_count: usize,
 ) -> Option<RowAction> {
-    ui.horizontal(|ui| {
-        ui.label("🔍");
-        ui.add(egui::TextEdit::singleline(&mut filter.text).hint_text("Filter name / NORAD id"));
-        if ui.button("✕").clicked() {
-            filter.text.clear();
-        }
-    });
+    // A single plain filter box spanning the panel. The 🔍 glyph and the ✕
+    // clear button that used to flank it were two unexplained squares either
+    // side of the text, so both are gone — clearing is just select-all-delete.
+    ui.add_sized(
+        egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+        egui::TextEdit::singleline(&mut filter.text).hint_text("Filter name / NORAD id"),
+    );
     ui.separator();
 
     // Category dropdown. One group at a time (or All) — the list below is the
@@ -139,9 +139,12 @@ pub fn show_catalog(
 
     ui.horizontal(|ui| {
         ui.label("Category:");
+        // Fill the rest of the row: a fixed 150 px box on a ~220 px panel left
+        // a ragged gap down the right edge of the sidebar.
+        let combo_width = (ui.available_width() - 4.0).max(80.0);
         egui::ComboBox::from_id_salt("sidebar_category")
             .selected_text(egui::RichText::new(category.label()).color(category.color()))
-            .width(150.0)
+            .width(combo_width)
             .show_ui(ui, |ui| {
             ui.selectable_value(&mut category, CategorySel::All, format!("All ({})", sats.len()));
             for (i, g) in SatGroup::ALL.iter().enumerate() {

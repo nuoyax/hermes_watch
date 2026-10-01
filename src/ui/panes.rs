@@ -86,16 +86,6 @@ impl ViewKind {
         ViewKind::Catalog,
         ViewKind::Detail,
     ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ViewKind::Globe3D => "3D Globe",
-            ViewKind::WorldMap => "World Map",
-            ViewKind::GroundTrack => "Ground Track",
-            ViewKind::Catalog => "Catalog",
-            ViewKind::Detail => "Detail",
-        }
-    }
 }
 
 /// Per-pane state.
