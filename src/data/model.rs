@@ -100,4 +100,14 @@ impl SatGroup {
             SatGroup::Other => Color32::from_rgb(180, 180, 180),
         }
     }
+
+    /// The same hue as [`Self::color`], darkened until it reads on the
+    /// sidebar's light surface. `color` is tuned for the near-black globe and
+    /// world map; pasted onto a light panel most of these (gold, the pale
+    /// greens) drop to a contrast ratio near 1:1 and become invisible.
+    pub fn color_on_light(self) -> egui::Color32 {
+        let c = self.color();
+        let dim = |v: u8| (v as f32 * 0.62).round() as u8;
+        egui::Color32::from_rgb(dim(c.r()), dim(c.g()), dim(c.b()))
+    }
 }

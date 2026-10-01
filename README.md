@@ -27,7 +27,7 @@ In Greek mythology, **Hermes** — winged sandals, winged cap — is the swift m
 - 🛰 **SGP4 propagation** — full SGP4/SDP4 model, TEME → geodetic conversion, sub-satellite points and ground tracks (past 45 min → future 90 min), true inertial (ECI) orbit ellipses
 - 🖥 **Native UI** — egui/eframe with the glow renderer; no web stack, no Electron. GPU-textured rotating Earth with day/night terminator
 - 🪟 **Split panes** — 1 / 2H / 2V / 4 independent viewports, each with its own camera and selected satellite
-- 🔍 **Catalog sidebar** — full-text filter (name / NORAD id) + per-group color-coded toggles
+- 🔍 **Catalog sidebar** — a light panel with full-width clickable rows: full-text filter (name / NORAD id) + a color-coded category dropdown (All · Station · Weather · Navigation · Science · Comms · Military · Debris · Other), each entry showing its object count. Row names are black; satellites whose elements cannot be propagated are red.
 - 🗺 **Four view types** — 3D Globe · World Map · Ground Track · Detail — switchable independently per pane
 
 ## 🗺 Views

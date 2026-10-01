@@ -3,7 +3,7 @@
 use crate::ui::panes;
 use crate::ui::views;
 
-use crate::data::model::{Sat, SatGroup};
+use crate::data::model::Sat;
 use crate::orbit::Propagator;
 use crate::service::{FetchMsg, FetchStatus};
 use panes::{Layout, Pane, ViewKind};
@@ -30,7 +30,6 @@ pub struct App {
     pub active_pane: usize,
     pub filter: CatalogFilter,
     pub selected: Option<u32>,
-    pub groups_enabled: HashSet<SatGroup>,
     pub earth: crate::ui::views::globe3d::Earth,
     pub last_refresh: std::time::Instant,
     /// Simulation clock (accelerated). Rendering & propagation use this.
@@ -42,6 +41,18 @@ pub struct App {
     catalog_version: std::cell::Cell<usize>,
     /// Sidebar renders from this snapshot instead of cloning 16k sats/frame.
     catalog_snapshot: std::cell::RefCell<Vec<Sat>>,
+    /// Catalog satellites that fail to propagate as of `invalid_last_scan`:
+    /// unresolvable TLE epoch, no SGP4 constants, or a `propagate` error. The
+    /// sidebar paints these red — they have no position in the globe, the map
+    /// or their ground track, so the row warns before the user selects one.
+    invalid: HashSet<u32>,
+    /// When `invalid` was last recomputed. Rescanning 16k satellites every
+    /// frame costs a full SGP4 pass per frame; three minutes is far tighter
+    /// than the element sets' drift.
+    invalid_last_scan: std::time::Instant,
+    /// Catalog length `invalid` was computed against — a fetch that lands a new
+    /// source forces an immediate rescan instead of waiting out the interval.
+    invalid_catalog_len: usize,
 }
 
 impl App {
@@ -74,7 +85,6 @@ impl App {
             active_pane: 0,
             filter: CatalogFilter::default(),
             selected: None,
-            groups_enabled: SatGroup::ALL.iter().copied().collect(),
             earth: crate::ui::views::globe3d::Earth::load(),
             last_refresh: std::time::Instant::now(),
             sim_time: chrono::Utc::now(),
@@ -82,6 +92,10 @@ impl App {
             sim_last_frame: std::time::Instant::now(),
             catalog_version: std::cell::Cell::new(0),
             catalog_snapshot: std::cell::RefCell::new(Vec::new()),
+            invalid: HashSet::new(),
+            invalid_last_scan: std::time::Instant::now()
+                - std::time::Duration::from_secs(3600),
+            invalid_catalog_len: usize::MAX,
         }
     }
 
@@ -112,7 +126,6 @@ impl App {
             active_pane: 0,
             filter: CatalogFilter::default(),
             selected: None,
-            groups_enabled: SatGroup::ALL.iter().copied().collect(),
             earth: crate::ui::views::globe3d::Earth::load(),
             last_refresh: std::time::Instant::now(),
             sim_time: chrono::Utc::now(),
@@ -120,6 +133,10 @@ impl App {
             sim_last_frame: std::time::Instant::now(),
             catalog_version: std::cell::Cell::new(0),
             catalog_snapshot: std::cell::RefCell::new(Vec::new()),
+            invalid: HashSet::new(),
+            invalid_last_scan: std::time::Instant::now()
+                - std::time::Duration::from_secs(3600),
+            invalid_catalog_len: usize::MAX,
         }
     }
 
@@ -441,8 +458,14 @@ impl App {
     }
 
     fn sidebar(&mut self, ctx: &egui::Context) {
+        // Light surface: the rows themselves are black text (see `row_color`),
+        // which the dark theme this app uses elsewhere would swallow whole.
         egui::SidePanel::left("sidebar")
             .default_width(280.0)
+            .frame(
+                egui::Frame::side_top_panel(&ctx.style())
+                    .fill(egui::Color32::from_rgb(242, 242, 245)),
+            )
             .show(ctx, |ui| {
                 // Render from a snapshot taken only when the catalog changed,
                 // not a 16k-element clone on every frame (startup freeze).
@@ -452,12 +475,39 @@ impl App {
                     self.catalog_version.set(current);
                     *self.catalog_snapshot.borrow_mut() = self.catalog.read().clone();
                 }
+                self.rescan_invalid();
+
                 let sats = self.catalog_snapshot.borrow();
-                if let Some(norad) = show_catalog(ui, &sats, &mut self.filter) {
-                    drop(sats);
+                let clicked = show_catalog(ui, &sats, &mut self.filter, &self.invalid);
+                drop(sats);
+                if let Some(norad) = clicked {
                     self.focus_from_sidebar(norad);
                 }
             });
+    }
+
+    /// Refresh the set of satellites that cannot be propagated. A satellite is
+    /// unusable when its TLE epoch does not parse, its element set yields no
+    /// SGP4 constants, or `propagate` rejects the current time — exactly the
+    /// cases in which every view would silently draw nothing for it.
+    ///
+    /// Runs after a catalog change or every `INVALID_RESCAN`, not per frame:
+    /// the scan is a full SGP4 pass over the whole catalog.
+    fn rescan_invalid(&mut self) {
+        const INVALID_RESCAN: std::time::Duration = std::time::Duration::from_secs(180);
+        let catalog_changed = self.catalog_version.get() != self.invalid_catalog_len;
+        if !catalog_changed && self.invalid_last_scan.elapsed() < INVALID_RESCAN {
+            return;
+        }
+        let now = self.sim_time;
+        let sats = self.catalog_snapshot.borrow();
+        self.invalid = sats
+            .iter()
+            .filter(|s| self.prop.subpoint(s, now).is_none())
+            .map(|s| s.norad_id)
+            .collect();
+        self.invalid_catalog_len = self.catalog_version.get();
+        self.invalid_last_scan = std::time::Instant::now();
     }
 
     fn content(&mut self, ctx: &egui::Context) {
@@ -619,7 +669,7 @@ impl App {
                         }
                         ViewKind::Catalog => {
                             let mut filter = self.filter.clone();
-                            let clicked = show_catalog(&mut child, &sats, &mut filter);
+                            let clicked = show_catalog(&mut child, &sats, &mut filter, &self.invalid);
                             self.filter = filter;
                             if let Some(n) = clicked {
                                 // `i` — this list belongs to pane `i`, exactly
@@ -769,6 +819,8 @@ fn view_toggle(ctx: &egui::Context, pane_rect: egui::Rect, current: ViewKind) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data::model::SatGroup;
+    use crate::ui::views::catalog::CategorySel;
 
     /// Deterministic stand-in catalog; the TLEs are empty on purpose (SGP4 then
     /// fails, so no view does real propagation work in these tests).
@@ -994,6 +1046,50 @@ mod tests {
         assert!(
             activated.iter().filter(|a| **a).count() == 1,
             "exactly one pane may be activated per click: {activated:?}"
+        );
+    }
+
+    /// The sidebar used to carry a second, never-read `HashSet<SatGroup>`
+    /// (`groups_enabled`) alongside the one the filter actually used. Dropping
+    /// it must not change the default: a freshly built app lists everything.
+    #[test]
+    fn sidebar_starts_unfiltered() {
+        let mut app = new_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, egui::RawInput::default());
+
+        assert_eq!(app.filter.category, CategorySel::All);
+        assert!(app.filter.text.is_empty());
+
+        let sats = app.catalog.read();
+        assert_eq!(sats.len(), NORADS.len());
+        assert!(
+            sats.iter().all(|s| app.filter.matches(s)),
+            "default filter must not hide any satellite"
+        );
+    }
+
+    /// Selecting a category narrows the sidebar list to that group only.
+    #[test]
+    fn category_selection_filters_the_sidebar_list() {
+        let mut app = new_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, egui::RawInput::default());
+
+        // The stand-in catalog is all `Station`; Weather has nothing to show.
+        app.filter.category = CategorySel::One(SatGroup::Weather);
+        frame(&mut app, &ctx, egui::RawInput::default());
+
+        let sats = app.catalog.read();
+        assert!(
+            !sats.iter().any(|s| app.filter.matches(s)),
+            "Weather selection must hide every Station satellite"
+        );
+
+        app.filter.category = CategorySel::One(SatGroup::Station);
+        assert!(
+            sats.iter().all(|s| app.filter.matches(s)),
+            "Station selection must admit every Station satellite"
         );
     }
 }
