@@ -12,7 +12,11 @@ const ROW_COLOR: egui::Color32 = egui::Color32::from_rgb(16, 16, 18);
 const ROW_INVALID_COLOR: egui::Color32 = egui::Color32::from_rgb(192, 32, 32);
 /// Fill behind a row under the pointer. Rows span the whole panel width, so the
 /// hover is the only thing that shows the hit area reaches past the text.
-const ROW_HOVER_COLOR: egui::Color32 = egui::Color32::from_rgb(219, 219, 226);
+///
+/// Tuned against the sidebar surface `#F2F2F5`: a first pass at `#DBDBE2` was
+/// only 23 levels away from it and users read the row as un-hovered, so this
+/// sits ~50 below the surface while staying light enough for black row ink.
+const ROW_HOVER_COLOR: egui::Color32 = egui::Color32::from_rgb(192, 196, 212);
 
 /// Height of one catalog row, in points. `show_rows` and the row painter must
 /// agree on it, so it lives here rather than as a literal at both call sites.
@@ -276,9 +280,20 @@ mod tests {
     fn hover_fill_contrasts_with_the_sidebar_surface() {
         let surface = egui::Color32::from_rgb(242, 242, 245);
         let d = |a: u8, b: u8| (a as i32 - b as i32).abs();
-        assert!(d(ROW_HOVER_COLOR.r(), surface.r()) > 10, "hover fill is invisible");
+        // 23 levels was too subtle to read as hover on a real screen; require a
+        // clearly perceptible step.
+        assert!(
+            d(ROW_HOVER_COLOR.r(), surface.r()) > 40,
+            "hover fill is too close to the sidebar surface to read as hover"
+        );
         assert_ne!(ROW_HOVER_COLOR, ROW_INVALID_COLOR);
         assert_ne!(ROW_HOVER_COLOR, ROW_COLOR);
+        // Still a light fill: black row ink has to stay legible on top of it.
+        let luma = (ROW_HOVER_COLOR.r() as u32 * 2
+            + ROW_HOVER_COLOR.g() as u32 * 5
+            + ROW_HOVER_COLOR.b() as u32)
+            / 8;
+        assert!(luma > 150, "hover fill is too dark for the black row ink");
     }
 
     /// The sidebar is a light surface, so group tints have to be darkened or
