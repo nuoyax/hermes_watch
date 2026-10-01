@@ -160,8 +160,14 @@ impl App {
         }
     }
 
-    fn sat_by_norad(&self, norad: u32) -> Option<Sat> {
-        self.catalog.read().iter().find(|s| s.norad_id == norad).cloned()
+    /// Look up one satellite in a catalog slice the caller already holds.
+    ///
+    /// Takes the slice rather than reading the shared lock itself: `parking_lot`
+    /// `RwLock` is not reentrant, so calling this while `content` already holds
+    /// the read guard deadlocks the UI thread the moment a fetcher queues a
+    /// write. That was the "not responding" hang.
+    fn sat_by_norad(sats: &[Sat], norad: u32) -> Option<Sat> {
+        sats.iter().find(|s| s.norad_id == norad).cloned()
     }
 
     /// Recompute this pane's orbit ring only when the satellite changed, the
@@ -529,7 +535,7 @@ impl App {
                     );
                     let pane = self.panes[i].clone();
                     // Each pane tracks exactly one satellite.
-                    let focus_sat = pane.focus_norad.and_then(|n| self.sat_by_norad(n));
+                    let focus_sat = pane.focus_norad.and_then(|n| Self::sat_by_norad(sats, n));
                     let title = match &focus_sat {
                         Some(sat) => format!("{} — {}", pane.view.label(), sat.name),
                         None => format!("{} — (select a satellite)", pane.view.label()),

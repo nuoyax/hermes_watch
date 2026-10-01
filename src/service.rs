@@ -75,9 +75,13 @@ pub fn spawn(
                 }
             }
 
+            // Read the length BEFORE taking the status write lock: holding
+            // `status` while acquiring `catalog` inverts the order the UI uses
+            // (`catalog` then `status`), which is the classic ABBA deadlock.
+            let total = catalog.read().len();
             let mut st = status.write();
             st.sources_done += 1;
-            st.total_sats = catalog.read().len();
+            st.total_sats = total;
             drop(st);
 
             let _ = tx.send(FetchMsg::SourceDone {
