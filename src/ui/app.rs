@@ -10,7 +10,7 @@ use panes::{Layout, Pane, ViewKind};
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;
-use views::catalog::CatalogFilter;
+use views::catalog::{truncate, CatalogFilter, RowAction};
 use views::show_catalog;
 
 pub struct App {
@@ -53,6 +53,41 @@ pub struct App {
     /// Catalog length `invalid` was computed against — a fetch that lands a new
     /// source forces an immediate rescan instead of waiting out the interval.
     invalid_catalog_len: usize,
+    /// The most recent "Added ... to Window N" notice: which pane it belongs
+    /// to and the frozen text. Only one is kept — clicking several rows in a
+    /// row replaces the notice instead of stacking texts that fade together.
+    toast: Option<Toast>,
+}
+
+/// A transient notice drawn in the top-left of the pane a satellite was added
+/// to. The text is fixed when the notice is raised, so a later selection cannot
+/// rewrite a notice that is still fading.
+struct Toast {
+    text: String,
+    /// 0-based index of the pane this notice belongs to — only that pane draws
+    /// it.
+    pane: usize,
+    born: std::time::Instant,
+}
+
+impl Toast {
+    /// Fade in, hold, fade out — `None` once the whole sequence is over, which
+    /// is the caller's cue to drop the notice.
+    fn alpha(&self, now: std::time::Instant) -> Option<f32> {
+        const FADE: f32 = 0.45; // in and out, each
+        const HOLD: f32 = 2.4; // fully opaque
+        let total = HOLD + 2.0 * FADE;
+        let t = now.duration_since(self.born).as_secs_f32();
+        if t >= total {
+            None
+        } else if t < FADE {
+            Some(t / FADE)
+        } else if t < FADE + HOLD {
+            Some(1.0)
+        } else {
+            Some(((total - t) / FADE).clamp(0.0, 1.0))
+        }
+    }
 }
 
 impl App {
@@ -96,6 +131,7 @@ impl App {
             invalid_last_scan: std::time::Instant::now()
                 - std::time::Duration::from_secs(3600),
             invalid_catalog_len: usize::MAX,
+            toast: None,
         }
     }
 
@@ -137,6 +173,7 @@ impl App {
             invalid_last_scan: std::time::Instant::now()
                 - std::time::Duration::from_secs(3600),
             invalid_catalog_len: usize::MAX,
+            toast: None,
         }
     }
 
@@ -463,6 +500,97 @@ impl App {
         self.focus_sat_in_pane(self.active_pane, norad);
     }
 
+    /// Apply one catalog-row gesture; returns text to put on the clipboard.
+    ///
+    /// It returns the text rather than copying it itself: the clipboard needs a
+    /// `Context`, and keeping this a pure state transition is what lets the
+    /// tests drive every gesture without a window. The copy paths are also the
+    /// only ones that must touch no pane state at all.
+    fn apply_row_action(
+        &mut self,
+        action: RowAction,
+        now: std::time::Instant,
+    ) -> Option<String> {
+        match action {
+            RowAction::Focus(norad) => {
+                self.focus_from_sidebar(norad);
+                None
+            }
+            RowAction::AddToPane { norad, pane } => {
+                // `pane < len` is a guard, not the normal path: the menu lists
+                // one entry per window that exists, computed in the same frame.
+                // A stale index must do nothing rather than panic on
+                // `self.panes[pane]`.
+                if pane < self.panes.len() {
+                    self.focus_sat_in_pane(pane, norad);
+                    let name = self
+                        .catalog_snapshot
+                        .borrow()
+                        .iter()
+                        .find(|s| s.norad_id == norad)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| format!("#{norad}"));
+                    self.toast = Some(Toast {
+                        text: format!(
+                            "Added {} to Window {}",
+                            truncate(&name, 24),
+                            pane + 1
+                        ),
+                        pane,
+                        born: now,
+                    });
+                }
+                None
+            }
+            RowAction::CopyNorad(norad) => Some(norad.to_string()),
+            RowAction::CopyTle(norad) => {
+                let sats = self.catalog_snapshot.borrow();
+                sats.iter()
+                    .find(|s| s.norad_id == norad)
+                    .map(|s| format!("{}\n{}", s.tle.line1, s.tle.line2))
+            }
+        }
+    }
+
+    /// Paint one pane's notice. Returns `false` once the notice has run its
+    /// course, which is the caller's cue to drop it.
+    ///
+    /// Painted on `pane_layer(index)`, the pane's own layer, and after all of
+    /// the pane's content (the caller runs it after the view match) — later
+    /// paint wins within a layer, so the notice sits on top of the globe, the
+    /// map and the ground track without reaching any other pane.
+    fn draw_toast(
+        ctx: &egui::Context,
+        index: usize,
+        pixels: egui::Rect,
+        toast: &Toast,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(alpha) = toast.alpha(now) else {
+            return false;
+        };
+        let painter = ctx.layer_painter(panes::pane_layer(index));
+        let galley = painter.layout_no_wrap(
+            toast.text.clone(),
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE.gamma_multiply(alpha),
+        );
+        // Below the 18 px title bar, which already carries
+        // "3D Globe — <name>" and would be overprinted by a notice drawn at
+        // `pixels.min`.
+        let pos = pixels.min + egui::Vec2::new(8.0, 26.0);
+        // A translucent backing plate: white text alone disappears over the
+        // bright parts of `earth_day.jpg`. Plate and text fade together.
+        let plate = egui::Rect::from_min_size(pos, galley.size() + egui::vec2(10.0, 6.0));
+        painter.rect_filled(
+            plate,
+            3.0,
+            egui::Color32::from_black_alpha((150.0 * alpha) as u8),
+        );
+        painter.galley(pos + egui::vec2(5.0, 3.0), galley, egui::Color32::WHITE);
+        true
+    }
+
     fn sidebar(&mut self, ctx: &egui::Context) {
         // Light surface: the rows themselves are black text (see `row_color`),
         // which the dark theme this app uses elsewhere would swallow whole.
@@ -484,10 +612,19 @@ impl App {
                 self.rescan_invalid();
 
                 let sats = self.catalog_snapshot.borrow();
-                let clicked = show_catalog(ui, &sats, &mut self.filter, &self.invalid);
+                let action = show_catalog(
+                    ui,
+                    &sats,
+                    &mut self.filter,
+                    &self.invalid,
+                    self.panes.len(),
+                );
                 drop(sats);
-                if let Some(norad) = clicked {
-                    self.focus_from_sidebar(norad);
+                if let Some(action) = action {
+                    if let Some(text) = self.apply_row_action(action, std::time::Instant::now())
+                    {
+                        ctx.copy_text(text);
+                    }
                 }
             });
     }
@@ -517,6 +654,11 @@ impl App {
     }
 
     fn content(&mut self, ctx: &egui::Context) {
+        // A row gesture from a pane's own Catalog list. It is applied after the
+        // panel closure: `apply_row_action` needs `&mut self`, and the closure
+        // holds the catalog read guard, so acting inside it would borrow `self`
+        // both ways at once.
+        let mut deferred: Option<RowAction> = None;
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_rgb(16, 18, 22)))
             .show(ctx, |ui| {
@@ -675,19 +817,48 @@ impl App {
                         }
                         ViewKind::Catalog => {
                             let mut filter = self.filter.clone();
-                            let clicked = show_catalog(&mut child, &sats, &mut filter, &self.invalid);
+                            let action = show_catalog(
+                                &mut child,
+                                &sats,
+                                &mut filter,
+                                &self.invalid,
+                                self.panes.len(),
+                            );
                             self.filter = filter;
-                            if let Some(n) = clicked {
-                                // `i` — this list belongs to pane `i`, exactly
-                                // the pane the user is pointing at, while
-                                // `active_pane` cannot have caught up with this
-                                // frame's click on that pane yet (the activation
-                                // widget is served from the previous pass's
-                                // rects). TASK-025 guard.
-                                self.selected = Some(n);
-                                self.panes[i].focus_norad = Some(n);
+                            if let Some(action) = action {
+                                match action {
+                                    RowAction::Focus(n) => {
+                                        // The row belongs to pane `i`, exactly
+                                        // the pane the user is pointing at,
+                                        // while `active_pane` cannot have
+                                        // caught up with this frame's click on
+                                        // that pane yet (the activation widget
+                                        // is served from the previous pass's
+                                        // rects). TASK-025 guard.
+                                        self.selected = Some(n);
+                                        self.panes[i].focus_norad = Some(n);
+                                    }
+                                    // The menu names its own target window, so
+                                    // it goes through the shared path rather
+                                    // than assuming pane `i` — deferred to
+                                    // after the panel (see `deferred`).
+                                    other => deferred = Some(other),
+                                }
                             }
                         }
+                    }
+
+                    // "Added ... to Window N" notice. Drawn after the view so
+                    // it lands on top of the globe/map/ground track, and on the
+                    // pane's own layer so it cannot spill into another pane.
+                    let toast_done = match &self.toast {
+                        Some(t) if t.pane == i => {
+                            !Self::draw_toast(ctx, i, pixels, t, std::time::Instant::now())
+                        }
+                        _ => false,
+                    };
+                    if toast_done {
+                        self.toast = None;
                     }
 
                     // 3D/2D switch in the pane's top-right corner. `i` is the
@@ -702,6 +873,12 @@ impl App {
                     }
                 }
             });
+
+        if let Some(action) = deferred {
+            if let Some(text) = self.apply_row_action(action, std::time::Instant::now()) {
+                ctx.copy_text(text);
+            }
+        }
     }
 }
 
@@ -1053,6 +1230,189 @@ mod tests {
             activated.iter().filter(|a| **a).count() == 1,
             "exactly one pane may be activated per click: {activated:?}"
         );
+    }
+
+    /// Right-clicking a row and picking "Add ... to Window 3" must retarget
+    /// exactly that window and raise a notice naming it — leaving every other
+    /// window's satellite and every window's view alone.
+    #[test]
+    fn add_to_pane_targets_exactly_that_window_and_raises_a_toast() {
+        let mut app = new_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, egui::RawInput::default());
+
+        app.set_pane_state(vec![
+            (Some(NORADS[0]), ViewKind::Globe3D),
+            (Some(NORADS[1]), ViewKind::WorldMap),
+            (Some(NORADS[2]), ViewKind::Globe3D),
+            (Some(NORADS[3]), ViewKind::Detail),
+        ]);
+        let before = app.pane_state();
+
+        let clipboard = app.apply_row_action(
+            RowAction::AddToPane {
+                norad: NORADS[4],
+                pane: 2,
+            },
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(clipboard, None, "adding must not touch the clipboard");
+        let after = app.pane_state();
+        assert_eq!(after[2], (Some(NORADS[4]), ViewKind::Globe3D));
+        let changed: Vec<usize> = before
+            .iter()
+            .zip(&after)
+            .enumerate()
+            .filter(|(_, (b, a))| b != a)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(changed, vec![2], "only window 3 (index 2) may change");
+
+        let toast = app.toast.as_ref().expect("an add raises a notice");
+        assert_eq!(toast.pane, 2, "the notice belongs to the target window");
+        assert!(toast.text.starts_with("Added "), "{}", toast.text);
+        assert!(toast.text.contains("SAT 20580"), "{}", toast.text);
+        assert!(toast.text.ends_with("Window 3"), "{}", toast.text);
+    }
+
+    /// The chosen behaviour when the target window is already tracking
+    /// something: replace it, and say so.
+    #[test]
+    fn add_to_pane_replaces_the_occupant_instead_of_refusing() {
+        let mut app = new_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, egui::RawInput::default());
+
+        app.panes[1].focus_norad = Some(NORADS[0]);
+        app.apply_row_action(
+            RowAction::AddToPane {
+                norad: NORADS[5],
+                pane: 1,
+            },
+            std::time::Instant::now(),
+        );
+        assert_eq!(
+            app.panes[1].focus_norad,
+            Some(NORADS[5]),
+            "the occupant was not replaced"
+        );
+        assert!(
+            app.toast
+                .as_ref()
+                .is_some_and(|t| t.text.contains("SAT 25338")),
+            "the notice must name the satellite that went in"
+        );
+    }
+
+    /// A pane index past the end of the layout does nothing at all — no panic,
+    /// no state change, no notice.
+    #[test]
+    fn add_to_pane_out_of_range_is_a_no_op() {
+        let mut app = new_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, egui::RawInput::default());
+        let before = app.pane_state();
+
+        let clipboard = app.apply_row_action(
+            RowAction::AddToPane {
+                norad: NORADS[4],
+                pane: 9,
+            },
+            std::time::Instant::now(),
+        );
+
+        assert_eq!(clipboard, None);
+        assert_eq!(app.pane_state(), before, "an out-of-range pane must not write");
+        assert!(app.toast.is_none(), "and must not raise a notice");
+    }
+
+    /// "左键单击不在加入的窗口" — the left-click gesture keeps the TASK-025
+    /// meaning (focus in the active window) and raises no notice.
+    #[test]
+    fn left_click_focus_does_not_raise_a_toast() {
+        let mut app = new_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, egui::RawInput::default());
+
+        app.active_pane = 3;
+        let before = app.pane_state();
+
+        let clipboard = app.apply_row_action(RowAction::Focus(NORADS[6]), std::time::Instant::now());
+
+        assert_eq!(clipboard, None);
+        assert_eq!(app.pane_state()[3].0, Some(NORADS[6]));
+        assert_eq!(
+            app.pane_state()
+                .iter()
+                .zip(&before)
+                .filter(|(a, b)| a != b)
+                .count(),
+            1,
+            "focus must move exactly one window"
+        );
+        assert!(
+            app.toast.is_none(),
+            "a plain left click is not an 'add to window' and must not notify"
+        );
+    }
+
+    /// The two copy entries return the text for the clipboard and change no
+    /// pane state — the paths a user hits to paste an id into a script.
+    #[test]
+    fn copy_actions_change_no_pane_state() {
+        let mut app = new_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx, egui::RawInput::default());
+        let before = app.pane_state();
+
+        assert_eq!(
+            app.apply_row_action(RowAction::CopyNorad(NORADS[2]), std::time::Instant::now()),
+            Some(NORADS[2].to_string())
+        );
+        // The stand-in catalog has empty TLE lines; the contract is "both lines,
+        // newline separated", so that is what is asserted.
+        assert_eq!(
+            app.apply_row_action(RowAction::CopyTle(NORADS[2]), std::time::Instant::now()),
+            Some("\n".to_string())
+        );
+        assert_eq!(app.pane_state(), before, "copying must not retarget a window");
+        assert!(app.toast.is_none());
+    }
+
+    /// The notice fades in, holds opaque, fades out, then reports itself gone.
+    #[test]
+    fn toast_fades_in_holds_fades_and_ends() {
+        let born = std::time::Instant::now();
+        let toast = Toast {
+            text: "Added SAT to Window 1".into(),
+            pane: 0,
+            born,
+        };
+        let at = |secs: f32| born + std::time::Duration::from_secs_f32(secs);
+
+        // Just faded in: near zero.
+        let a = toast.alpha(at(0.0)).expect("still alive at t=0");
+        assert!(a < 0.05, "expected a fade-in start, got {a}");
+
+        // Mid fade-in: strictly between.
+        let a = toast.alpha(at(0.22)).expect("alive during fade-in");
+        assert!(a > 0.3 && a < 0.8, "expected a partial fade-in, got {a}");
+
+        // Hold: [FADE, FADE + HOLD) = [0.45, 2.85).
+        assert_eq!(toast.alpha(at(0.45)), Some(1.0), "the hold starts at FADE");
+        assert_eq!(toast.alpha(at(0.6)), Some(1.0));
+        assert_eq!(toast.alpha(at(2.8)), Some(1.0), "still holding just before 2.85");
+        assert!(
+            toast.alpha(at(2.9)).is_some_and(|a| a < 1.0),
+            "2.9s is already 0.05s into the fade-out"
+        );
+
+        // Fade-out then gone.
+        let a = toast.alpha(at(3.1)).expect("alive during fade-out");
+        assert!(a > 0.0 && a < 1.0, "expected a partial fade-out, got {a}");
+        assert_eq!(toast.alpha(at(3.4)), None, "the notice must end");
+        assert_eq!(toast.alpha(at(60.0)), None, "and stay ended");
     }
 
     /// The sidebar used to carry a second, never-read `HashSet<SatGroup>`

@@ -86,16 +86,37 @@ impl CatalogFilter {
     }
 }
 
-/// Returns the NORAD id of a clicked row (if any).
+/// What the user asked for by acting on a catalog row.
+///
+/// One enum instead of a bare `Option<u32>` because a row now has two
+/// gestures: a left click (the TASK-025 "focus this satellite" behaviour) and a
+/// right-click menu, which is where the extra operations live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowAction {
+    /// Left click: point the pane the user is working in at this satellite.
+    Focus(u32),
+    /// Right-click "Add ... to Window N": pane `pane` (0-based) tracks this
+    /// satellite from now on, replacing whatever it was tracking.
+    AddToPane { norad: u32, pane: usize },
+    /// Right-click "Copy NORAD id".
+    CopyNorad(u32),
+    /// Right-click "Copy TLE" (both element lines).
+    CopyTle(u32),
+}
+
+/// Returns what the user did to a row this frame (if anything).
 ///
 /// `invalid` holds the satellites that cannot be propagated this frame; their
-/// rows are drawn red.
+/// rows are drawn red. `pane_count` is how many windows the layout currently
+/// has — the right-click menu offers one "Add to Window N" entry per window and
+/// none for a window that is not on screen.
 pub fn show_catalog(
     ui: &mut egui::Ui,
     sats: &[Sat],
     filter: &mut CatalogFilter,
     invalid: &HashSet<u32>,
-) -> Option<u32> {
+    pane_count: usize,
+) -> Option<RowAction> {
     ui.horizontal(|ui| {
         ui.label("🔍");
         ui.add(egui::TextEdit::singleline(&mut filter.text).hint_text("Filter name / NORAD id"));
@@ -133,7 +154,7 @@ pub fn show_catalog(
     filter.category = category;
     ui.separator();
 
-    let mut clicked = None;
+    let mut action = None;
     // The rows span the panel's full width rather than hugging the text: a row
     // that only covers its label leaves a wide strip the user reads as part of
     // the list but cannot click. `set_min_width` on the child UI makes every row
@@ -177,14 +198,51 @@ pub fn show_catalog(
                 ink,
             );
             if response.clicked() {
-                clicked = Some(sat.norad_id);
+                // Primary button only: `Response::clicked` is
+                // `fake_primary_click || clicked_by(Primary)`, so a right click
+                // never lands here and the menu below is the only secondary
+                // gesture a row has.
+                action = Some(RowAction::Focus(sat.norad_id));
             }
+            // Right click → menu. The menu root id is this Response's id, which
+            // has to be stable across frames or the popup the user just opened
+            // closes itself on the next pass. `allocate_exact_size` derives the
+            // id from the widget sequence, and the sequence before the rows is
+            // fixed (the search row, the category row, one `N satellites`
+            // label), so the same row keeps the same id frame to frame.
+            response.context_menu(|ui| {
+                for pane in 0..pane_count {
+                    let label = format!(
+                        "Add {} to Window {}",
+                        truncate(&sat.name, 18),
+                        pane + 1
+                    );
+                    if ui.button(label).clicked() {
+                        action = Some(RowAction::AddToPane {
+                            norad: sat.norad_id,
+                            pane,
+                        });
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui.button("Copy NORAD id").clicked() {
+                    action = Some(RowAction::CopyNorad(sat.norad_id));
+                    ui.close_menu();
+                }
+                if ui.button("Copy TLE").clicked() {
+                    action = Some(RowAction::CopyTle(sat.norad_id));
+                    ui.close_menu();
+                }
+            });
         }
     });
-    clicked
+    action
 }
 
-fn truncate(s: &str, n: usize) -> String {
+/// Clip a name to `n` characters. Shared with `App` so the row and the
+/// "Added ... to Window N" toast cut a long name at the same place.
+pub fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
     } else {
@@ -272,6 +330,70 @@ mod tests {
         // invisible; and it must stay dark enough for the sidebar's light fill.
         assert_ne!(ROW_INVALID_COLOR, ROW_COLOR);
         assert!(ROW_INVALID_COLOR.r() > ROW_COLOR.r() + 80);
+    }
+
+    /// The right-click menu names the window it would target, and the action
+    /// carries the pane index rather than a display string — `App` writes
+    /// `panes[pane]`, so the index is the part that must survive.
+    #[test]
+    fn row_action_add_to_pane_names_the_window() {
+        let a = RowAction::AddToPane {
+            norad: 25544,
+            pane: 2,
+        };
+        assert_eq!(
+            a,
+            RowAction::AddToPane {
+                norad: 25544,
+                pane: 2
+            }
+        );
+        assert_ne!(
+            a,
+            RowAction::AddToPane {
+                norad: 25544,
+                pane: 3
+            },
+            "the pane index is the whole point of the action"
+        );
+        assert_ne!(
+            a,
+            RowAction::AddToPane {
+                norad: 33591,
+                pane: 2
+            }
+        );
+    }
+
+    /// Four gestures, four variants: folding any two together would silently
+    /// turn (say) "copy" into "retarget a window".
+    #[test]
+    fn row_action_variants_are_distinct() {
+        let all = [
+            RowAction::Focus(25544),
+            RowAction::AddToPane {
+                norad: 25544,
+                pane: 0,
+            },
+            RowAction::CopyNorad(25544),
+            RowAction::CopyTle(25544),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(i == j, a == b, "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    /// A name long enough to blow the menu off the screen is cut, and the cut
+    /// is the same one the row itself makes.
+    #[test]
+    fn long_names_are_truncated_for_the_menu() {
+        let long = "A VERY LONG SATELLITE NAME THAT WOULD WIDEN THE MENU";
+        let clipped = truncate(long, 18);
+        assert_eq!(clipped.chars().count(), 19, "18 chars plus the ellipsis");
+        assert!(clipped.ends_with('…'));
+        assert_eq!(truncate("SHORT", 18), "SHORT", "short names pass through");
     }
 
     /// The hover fill has to be visible on the sidebar's pale surface without
