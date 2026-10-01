@@ -62,6 +62,10 @@ pub struct App {
 /// A transient notice drawn in the top-left of the pane a satellite was added
 /// to. The text is fixed when the notice is raised, so a later selection cannot
 /// rewrite a notice that is still fading.
+/// Deliberately small: it is a confirmation the eye catches in passing, not a
+/// label competing with the pane's own title bar.
+const TOAST_FONT_SIZE: f32 = 10.0;
+
 struct Toast {
     text: String,
     /// 0-based index of the pane this notice belongs to — only that pane draws
@@ -572,7 +576,7 @@ impl App {
         let painter = ctx.layer_painter(panes::pane_layer(index));
         let galley = painter.layout_no_wrap(
             toast.text.clone(),
-            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(TOAST_FONT_SIZE),
             egui::Color32::WHITE.gamma_multiply(alpha),
         );
         // Below the 18 px title bar, which already carries
@@ -581,13 +585,13 @@ impl App {
         let pos = pixels.min + egui::Vec2::new(8.0, 26.0);
         // A translucent backing plate: white text alone disappears over the
         // bright parts of `earth_day.jpg`. Plate and text fade together.
-        let plate = egui::Rect::from_min_size(pos, galley.size() + egui::vec2(10.0, 6.0));
+        let plate = egui::Rect::from_min_size(pos, galley.size() + egui::vec2(8.0, 4.0));
         painter.rect_filled(
             plate,
             3.0,
             egui::Color32::from_black_alpha((150.0 * alpha) as u8),
         );
-        painter.galley(pos + egui::vec2(5.0, 3.0), galley, egui::Color32::WHITE);
+        painter.galley(pos + egui::vec2(4.0, 2.0), galley, egui::Color32::WHITE);
         true
     }
 
