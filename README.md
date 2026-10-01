@@ -16,7 +16,7 @@
 
 In Greek mythology, **Hermes** — winged sandals, winged cap — is the swift messenger of the gods, patron of travelers and the skies. *Hermes Watch* gives that role to your desktop: it fetches live two-line element (TLE) sets from public catalogs, propagates every orbit with SGP4, and renders the whole constellation in real time.
 
-![Hermes Watch screenshot](docs/screenshot.png)
+![Hermes Watch screenshot](docs/app-screenshot.png)
 *<p align="center">3D globe pane — live SGP4 orbit on a textured Earth</p>*
 
 ---

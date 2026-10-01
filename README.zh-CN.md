@@ -16,7 +16,7 @@
 
 希腊神话中，**赫尔墨斯（Hermes）**脚踏飞鞋、头戴翼帽，是众神的信使、旅者与天空的守护神。*Hermes Watch* 把这个角色交给你的桌面：启动即抓取公开 TLE 轨道数据，用 SGP4 推演每颗卫星的轨道，并实时渲染整个星座。
 
-![Hermes Watch 截图](docs/screenshot.png)
+![Hermes Watch 截图](docs/app-screenshot.png)
 *<p align="center">3D 地球窗格 — 贴图地球上的实时 SGP4 轨道</p>*
 
 ---
